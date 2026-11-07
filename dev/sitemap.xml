@@ -11,6 +11,11 @@
          <changefreq>daily</changefreq>
     </url>
     <url>
+         <loc>https://retrofoundry.github.io/reality64/dev/audio-microcode/</loc>
+         <lastmod>2026-11-07</lastmod>
+         <changefreq>daily</changefreq>
+    </url>
+    <url>
          <loc>https://retrofoundry.github.io/reality64/dev/capture/</loc>
          <lastmod>2026-11-07</lastmod>
          <changefreq>daily</changefreq>

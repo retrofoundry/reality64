@@ -6,7 +6,7 @@
 //! an `end` line, replay ends at the last change.
 
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::gamepad::snapshot::GamepadSnapshot;
 
@@ -244,11 +244,15 @@ fn with_script<T>(f: impl FnOnce(&mut Script) -> T) -> T {
 impl Script {
     /// Frame 0 is latched once here, so reads before the first swap all agree.
     fn new(replay: Option<Replay>, record: Option<Record>, live: GamepadSnapshot) -> Self {
+        let latched = replay.as_ref().map_or(live, |replay| GamepadSnapshot {
+            bits: replay.bits,
+            ..GamepadSnapshot::default()
+        });
         let mut script = Script {
             replay,
             record,
             frame: 0,
-            latched: live,
+            latched,
         };
         if script.scripted() {
             script.latch(live);
@@ -287,6 +291,14 @@ pub fn on_swap() {
         script.frame += 1;
         script.latch(live);
     });
+}
+
+pub fn replaying() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    if !REQUESTED.get_or_init(|| std::env::var_os("REALITY64_INPUT_REPLAY").is_some()) {
+        return false;
+    }
+    with_script(|script| script.replay.as_ref().is_some_and(|replay| !replay.done))
 }
 
 pub fn read() -> GamepadSnapshot {
@@ -451,6 +463,18 @@ mod tests {
             seen.push(script.read(live).button);
         }
         assert_eq!(seen, [0, 0, 0x8000, 0x8000, 0x8000, 0x0010]);
+    }
+
+    #[test]
+    fn replay_before_first_change_does_not_sample_live_input() {
+        let recording = parse(&format!("{HEADER} 1\n2 8000 0 0\nend 4\n")).unwrap();
+        let live = pad(0x4000, 80, -80);
+        let script = Script::new(Some(recording.into()), None, live);
+        let first = script.read(live);
+        assert_eq!(
+            (first.button, first.stick_x, first.stick_y, first.bits),
+            (0, 0, 0, 1)
+        );
     }
 
     #[test]

@@ -7,13 +7,41 @@
 //! The TV-family -> refresh-rate mapping lives here and is exported for the audio AI
 //! frequency path so VI and AI never diverge on TV timing.
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::ultra::mesg;
+
+// 300 Hz represents both 50 and 60 Hz exactly, including a mid-replay mode change.
+static REPLAY_UNITS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn replay_nanos() -> Option<u64> {
+    crate::gamepad::script::replaying().then(replay_elapsed_nanos)
+}
+
+pub(crate) fn replay_elapsed_nanos() -> u64 {
+    deadline_nanos(REPLAY_UNITS.load(Ordering::Relaxed), 300)
+}
+
+fn replay_hz() -> u32 {
+    #[cfg(not(test))]
+    return resolve_refresh_hz().unwrap_or(REFRESH_NTSC_HZ);
+    #[cfg(test)]
+    REFRESH_NTSC_HZ
+}
+
+pub(crate) fn step_replay() -> bool {
+    if !crate::gamepad::script::replaying() || VI_EVENT.lock().unwrap().is_none() {
+        return false;
+    }
+    REPLAY_UNITS.fetch_add(u64::from(300 / replay_hz()), Ordering::Relaxed);
+    super::timer::service_replay();
+    post_retrace();
+    true
+}
 
 /// N64 retrace rates. NTSC/MPAL pace at 60 Hz; PAL at 50 Hz.
 pub const REFRESH_NTSC_HZ: u32 = 60;
@@ -341,9 +369,11 @@ pub extern "C" fn R64ViSetEvent(mq: *mut c_void, msg: *mut c_void, retrace: u32)
     // divisor test is deterministic; the loop machinery has dedicated unit tests.
     #[cfg(not(test))]
     {
-        let hz = resolve_refresh_hz().unwrap_or(REFRESH_NTSC_HZ);
-        let on_tick: TickFn = Arc::new(post_retrace);
-        apply_clock_rate(&mut CLOCK.lock().unwrap(), hz, on_tick);
+        if !crate::gamepad::script::replaying() {
+            let hz = resolve_refresh_hz().unwrap_or(REFRESH_NTSC_HZ);
+            let on_tick: TickFn = Arc::new(post_retrace);
+            apply_clock_rate(&mut CLOCK.lock().unwrap(), hz, on_tick);
+        }
     }
 }
 
@@ -378,7 +408,17 @@ pub extern "C" fn R64ViGetTvFamily(os_tv_type: u32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn R64ViSwapBuffer(fb: *mut c_void) {
+    let replaying = crate::gamepad::script::replaying();
     crate::gamepad::script::on_swap();
+    if replaying && !crate::gamepad::script::replaying() {
+        super::timer::finish_replay();
+        #[cfg(not(test))]
+        apply_clock_rate(
+            &mut CLOCK.lock().unwrap(),
+            replay_hz(),
+            Arc::new(post_retrace),
+        );
+    }
     super::rcp::send_render_control(super::rcp::RenderMsg::Scanout { address: fb as u64 });
 }
 
@@ -398,6 +438,95 @@ mod tests {
     }
 
     // ---- Rational absolute deadlines -------------------------------------------------
+
+    #[test]
+    fn replay_clock_and_timer_handoff() {
+        use super::super::timer::{self, OS_CPU_COUNTER};
+        use crate::gamepad::script;
+
+        if std::env::var_os("REALITY64_REPLAY_TEST_CHILD").is_none() {
+            let path =
+                std::env::temp_dir().join(format!("reality64_clock_{}.input", std::process::id()));
+            std::fs::write(
+                &path,
+                "reality64-input 1 1\n0 0000 0 0\n1 8000 0 0\nend 1\n",
+            )
+            .unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ultra::vi::tests::replay_clock_and_timer_handoff",
+                    "--nocapture",
+                ])
+                .env("REALITY64_INPUT_REPLAY", &path)
+                .env_remove("REALITY64_INPUT_RECORD")
+                .env("REALITY64_REPLAY_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let mut backing = [0u8; 64];
+        let mq = backing.as_mut_ptr() as *mut c_void;
+        let mut timer_key = 0u64;
+        let timer_ptr = &mut timer_key as *mut _ as *mut c_void;
+        mesg::R64MesgQueueCreate(mq, std::ptr::null_mut(), 8);
+        R64ViSetEvent(mq, 0x66 as *mut c_void, 1);
+        assert!(script::replaying());
+        assert_eq!(script::read().button, 0);
+        timer::R64SetTime(12345);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(timer::R64GetTime(), 12345);
+        assert_eq!(timer::R64GetCount(), 12345);
+        timer::R64SetTimer(
+            timer_ptr,
+            OS_CPU_COUNTER * 30 / 1000,
+            0,
+            mq,
+            0x77 as *mut c_void,
+        );
+        assert!(step_replay());
+        assert_eq!(mesg::recv(mq as usize, 0), (0, 0x66));
+        assert_eq!(mesg::recv(mq as usize, 0).0, -1);
+        assert!(step_replay());
+        assert_eq!(mesg::recv(mq as usize, 0), (0, 0x77));
+        assert_eq!(mesg::recv(mq as usize, 0), (0, 0x66));
+        assert_eq!(timer::R64StopTimer(timer_ptr), -1);
+        for _ in 0..120 {
+            assert!(step_replay());
+            assert_eq!(mesg::recv(mq as usize, 0), (0, 0x66));
+        }
+        R64ViSwapBuffer(std::ptr::null_mut());
+        assert_eq!(script::read().button, 0x8000);
+        timer::R64SetTimer(timer_ptr, OS_CPU_COUNTER / 10, 0, mq, 0x88 as *mut c_void);
+        let before = timer::R64GetTime();
+        R64ViSwapBuffer(std::ptr::null_mut());
+        assert!(!script::replaying());
+        assert!(!step_replay());
+        let after = timer::R64GetTime();
+        assert!(after >= before && after - before < OS_CPU_COUNTER / 10);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(timer::R64GetTime() > after);
+        assert_eq!(mesg::recv(mq as usize, 0).0, -1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if mesg::recv(mq as usize, 0) == (0, 0x88) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending replay timer did not survive handoff"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn rational_deadlines_do_not_accumulate_fractional_error() {

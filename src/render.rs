@@ -5,9 +5,10 @@ use crate::ultra::rcp::{take_render_receiver, RenderMsg};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 mod capture;
-
+mod interpolation;
 /// Dedup-then-log diagnostics: a message is logged at most once per process lifetime, keyed on
 /// `d.kind`'s `Display` string.
 pub(crate) struct DedupLogSink;
@@ -95,8 +96,7 @@ pub extern "C" fn R64RenderSetDataFormat(format: u32) {
 
 pub(crate) const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
-/// The surface config reality64 pins, matching ultragfx `Renderer::new` for `Some(Bgra8Unorm)`. `with_device`
-/// does not configure the surface, so the render thread calls `surface.configure` with this first.
+/// The initial surface config, matching ultragfx `Renderer::new` for `Some(Bgra8Unorm)`.
 pub(crate) fn surface_config(width: u32, height: u32) -> wgpu::SurfaceConfiguration {
     wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -115,6 +115,7 @@ pub struct SurfaceHandoff {
     pub surface: wgpu::Surface<'static>,
     pub width: u32,
     pub height: u32,
+    pub display_millihz: Option<u32>,
 }
 
 pub struct RenderContext {
@@ -124,14 +125,18 @@ pub struct RenderContext {
     capture_frame: Option<ultragfx::capture::CaptureFrame>,
     capture_sequence: Option<capture::SequenceRecording>,
     deferred_resize: Option<(u32, u32)>,
+    interpolation: interpolation::Settings,
+    pending_task: Option<ultragfx::interpolation::TaskHandle>,
 }
 
 impl RenderContext {
     /// Build the Renderer on this thread from the handed-over surface. Replicates ultragfx `new()`'s
-    /// device setup verbatim (`with_device` adopts a caller-made device and does not configure the
-    /// surface — spec §6). Panics here are caught by `spawn` (fatal-on-panic).
+    /// device setup, including the initial surface configuration before `with_device` adopts it.
+    /// Panics here are caught by `spawn`.
     pub fn from_handoff(h: SurfaceHandoff) -> RenderContext {
         let selection = capture::Selection::from_env().expect("reality64 capture configuration");
+        let interpolation = interpolation::Settings::from_env(selection.is_some())
+            .expect("reality64 refresh-rate configuration");
         if let Some(selection) = &selection {
             selection.install_shutdown_handler();
         }
@@ -140,6 +145,7 @@ impl RenderContext {
             surface,
             width,
             height,
+            display_millihz,
         } = h;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -162,11 +168,11 @@ impl RenderContext {
 
         let config = surface_config(width, height);
         surface.configure(&device, &config);
-
+        let target = ultragfx::PresentTarget::Surface { surface, config };
         let mut renderer = ultragfx::Renderer::with_device(
             device,
             queue,
-            ultragfx::PresentTarget::Surface { surface, config },
+            target,
             ultragfx::RendererConfig {
                 resolution_multiplier: 1,
                 sample_count: 1,
@@ -177,6 +183,12 @@ impl RenderContext {
             },
         );
         renderer.set_guest_writeback(true);
+        renderer
+            .set_display_refresh_rate(display_millihz)
+            .expect("monitor refresh rate");
+        renderer
+            .set_refresh_rate(interpolation.rate(crate::interpolation::port_settings().1))
+            .expect("refresh rate");
         let (capture_selection, capture_sequence) = match selection {
             Some(capture::Selection::Frames(selection)) => {
                 log::info!(
@@ -200,11 +212,19 @@ impl RenderContext {
             capture_frame: None,
             capture_sequence,
             deferred_resize: None,
+            interpolation,
+            pending_task: None,
         }
     }
 
-    pub fn consume_dl(&mut self, data_ptr: usize, microcode: ultragfx::Microcode) {
+    pub(crate) fn consume_dl(
+        &mut self,
+        data_ptr: usize,
+        microcode: ultragfx::Microcode,
+        sidecar: Option<crate::interpolation::Sidecar>,
+    ) {
         self.frame_serial += 1;
+        self.pending_task = None;
         let capture = if let Some(sequence) = &mut self.capture_sequence {
             if let Err(error) = sequence
                 .recorder
@@ -262,6 +282,28 @@ impl RenderContext {
                         bindings,
                     )
                     .map(|_| ())
+            } else if crate::interpolation::port_settings().0
+                && self.renderer.interpolation_active()
+            {
+                let sidecar = sidecar.unwrap_or_default();
+                let task = self.renderer.submit_task_host(
+                    ram,
+                    data_ptr as u64,
+                    microcode,
+                    &mut DedupLogSink,
+                    ultragfx::interpolation::TaskSubmission {
+                        info: ultragfx::interpolation::TaskInfo {
+                            cookie: self.frame_serial,
+                            source: sidecar.source,
+                            epoch: sidecar.epoch,
+                            producer_sample: sidecar.producer_sample,
+                        },
+                        annotations: Some(&sidecar.annotations),
+                        microcode_bindings: bindings,
+                    },
+                );
+                self.pending_task = Some(task);
+                Ok(())
             } else {
                 let _ = self.renderer.process_dl_host_with_bindings(
                     ram,
@@ -360,20 +402,76 @@ unsafe fn apply_guest_writes(patches: Vec<ultragfx::GuestWrite>) {
 
 /// Consume/present/resize seam so the loop's dispatch is unit-testable without a GPU.
 pub(crate) trait GfxConsumer {
-    fn consume_dl(&mut self, data_ptr: usize, microcode: ultragfx::Microcode);
+    fn consume_dl(
+        &mut self,
+        data_ptr: usize,
+        microcode: ultragfx::Microcode,
+        sidecar: Option<crate::interpolation::Sidecar>,
+    );
+    fn scanout(&mut self, address: u64, _enqueued_at: std::time::Instant) {
+        self.present(Some(address));
+    }
+    fn display_refresh_rate(&mut self, _millihz: Option<u32>) {}
     fn present(&mut self, address: Option<u64>);
     fn resize(&mut self, width: u32, height: u32);
+    fn original(&self) -> bool {
+        true
+    }
 }
 
 impl GfxConsumer for RenderContext {
-    fn consume_dl(&mut self, data_ptr: usize, microcode: ultragfx::Microcode) {
-        RenderContext::consume_dl(self, data_ptr, microcode)
+    fn consume_dl(
+        &mut self,
+        data_ptr: usize,
+        microcode: ultragfx::Microcode,
+        sidecar: Option<crate::interpolation::Sidecar>,
+    ) {
+        RenderContext::consume_dl(self, data_ptr, microcode, sidecar)
     }
     fn present(&mut self, address: Option<u64>) {
         RenderContext::present(self, address)
     }
+    fn scanout(&mut self, address: u64, enqueued_at: Instant) {
+        let rate = self
+            .interpolation
+            .rate(crate::interpolation::port_settings().1);
+        self.renderer
+            .set_refresh_rate(rate)
+            .expect("validated refresh rate");
+        let task = self.pending_task.take();
+        if self.capture_sequence.is_some() || self.capture_frame.is_some() {
+            self.present(Some(address));
+        } else {
+            let tasks = task.as_slice();
+            match self.renderer.scanout(
+                ultragfx::ScanoutOrigin::Host(Some(address)),
+                enqueued_at,
+                tasks,
+                task.as_ref(),
+            ) {
+                Ok(()) | Err(ultragfx::PresentError::SurfaceLost) => {}
+                Err(error) => {
+                    log::warn!("scanout: {error:?}");
+                    if self.renderer.presenter_error().is_some() {
+                        crate::ultra::request_shutdown();
+                    }
+                }
+            }
+        }
+        crate::interpolation::ACTIVE.store(self.renderer.interpolation_active(), Ordering::Release);
+    }
     fn resize(&mut self, width: u32, height: u32) {
         RenderContext::resize(self, width, height)
+    }
+    fn display_refresh_rate(&mut self, millihz: Option<u32>) {
+        self.renderer
+            .set_display_refresh_rate(millihz)
+            .expect("monitor refresh rate");
+    }
+    fn original(&self) -> bool {
+        self.interpolation
+            .rate(crate::interpolation::port_settings().1)
+            == ultragfx::RefreshRate::Original
     }
 }
 
@@ -386,20 +484,25 @@ pub(crate) fn render_loop_on(ctx: &mut impl GfxConsumer, rx: Receiver<RenderMsg>
                 data_ptr,
                 microcode,
                 done,
+                sidecar,
             } => {
-                ctx.consume_dl(data_ptr, microcode);
+                ctx.consume_dl(data_ptr, microcode, sidecar);
                 let _ = done.send(()); // release the blocked guest → it posts SP then DP
 
                 // OoT's pause setup task does not swap; keep the previous image until it does.
-                if scanout.is_none() {
+                if scanout.is_none() && ctx.original() {
                     ctx.present(None);
                 }
             }
-            RenderMsg::Scanout { address } => {
+            RenderMsg::Scanout {
+                address,
+                enqueued_at,
+            } => {
+                ctx.scanout(address, enqueued_at);
                 scanout = Some(address);
-                ctx.present(scanout);
             }
             RenderMsg::Resize { width, height } => ctx.resize(width, height),
+            RenderMsg::DisplayRefreshRate(millihz) => ctx.display_refresh_rate(millihz),
             RenderMsg::Shutdown => break,
         }
     }
@@ -500,7 +603,12 @@ mod tests {
         done_before_present: Receiver<()>,
     }
     impl super::GfxConsumer for FakeConsumer {
-        fn consume_dl(&mut self, data_ptr: usize, microcode: ultragfx::Microcode) {
+        fn consume_dl(
+            &mut self,
+            data_ptr: usize,
+            microcode: ultragfx::Microcode,
+            _sidecar: Option<crate::interpolation::Sidecar>,
+        ) {
             self.log
                 .push(format!("consume:{data_ptr:#x}:{microcode:?}"));
         }
@@ -524,6 +632,7 @@ mod tests {
         tx.send(RenderMsg::Gfx {
             data_ptr: 0xABC,
             microcode: ultragfx::Microcode::F3dex2NoN,
+            sidecar: None,
             done: tx_done,
         })
         .unwrap();
@@ -554,7 +663,12 @@ mod tests {
             presented: Vec<(Option<u64>, [u16; 3])>,
         }
         impl GfxConsumer for Consumer {
-            fn consume_dl(&mut self, word: usize, _: ultragfx::Microcode) {
+            fn consume_dl(
+                &mut self,
+                word: usize,
+                _: ultragfx::Microcode,
+                _: Option<crate::interpolation::Sidecar>,
+            ) {
                 assert!(matches!(
                     self.completions[self.consumed].try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty)
@@ -599,13 +713,18 @@ mod tests {
         let b = 0x2_0020_0000;
         for (swap, word) in [(Some(a), 0xfffc), (None, 0x4000), (Some(b), 0x8000)] {
             if let Some(address) = swap {
-                tx.send(RenderMsg::Scanout { address }).unwrap();
+                tx.send(RenderMsg::Scanout {
+                    address,
+                    enqueued_at: std::time::Instant::now(),
+                })
+                .unwrap();
             }
             let (done, receiver) = channel();
             consumer.completions.push(receiver);
             tx.send(RenderMsg::Gfx {
                 data_ptr: word,
                 microcode: ultragfx::Microcode::F3dex2,
+                sidecar: None,
                 done,
             })
             .unwrap();
@@ -618,6 +737,59 @@ mod tests {
                 (Some(a), [0, 0, 0x1234]),
                 (Some(b), [0xf801, 0x4000, 0x1234])
             ]
+        );
+    }
+
+    #[test]
+    fn no_swap_task_is_never_committed() {
+        struct Consumer {
+            consumed: u64,
+            committed: Vec<(u64, u64, std::time::Instant)>,
+        }
+        impl GfxConsumer for Consumer {
+            fn consume_dl(
+                &mut self,
+                _: usize,
+                _: ultragfx::Microcode,
+                _: Option<crate::interpolation::Sidecar>,
+            ) {
+                self.consumed += 1;
+            }
+            fn scanout(&mut self, address: u64, enqueued_at: std::time::Instant) {
+                self.committed.push((self.consumed, address, enqueued_at));
+            }
+            fn present(&mut self, _: Option<u64>) {}
+            fn resize(&mut self, _: u32, _: u32) {}
+        }
+        let (tx, rx) = channel();
+        let enqueued_at = std::time::Instant::now();
+        for swap in [Some(0x1000), None, Some(0x2000)] {
+            let (done, _receiver) = channel();
+            tx.send(RenderMsg::Gfx {
+                data_ptr: 0,
+                microcode: ultragfx::Microcode::F3dex2,
+                sidecar: None,
+                done,
+            })
+            .unwrap();
+            if let Some(address) = swap {
+                tx.send(RenderMsg::Scanout {
+                    address,
+                    enqueued_at,
+                })
+                .unwrap();
+            }
+        }
+        tx.send(RenderMsg::Shutdown).unwrap();
+        let mut consumer = Consumer {
+            consumed: 0,
+            committed: vec![],
+        };
+        render_loop_on(&mut consumer, rx);
+        assert_eq!(consumer.consumed, 3);
+        assert_eq!(
+            consumer.committed,
+            [(1, 0x1000, enqueued_at), (3, 0x2000, enqueued_at)]
         );
     }
 
@@ -642,5 +814,62 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("Shutdown must exit the loop; a regression fails here instead of hanging");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn interpolation_dispatches_every_swap_without_a_separate_present() {
+        struct Consumer {
+            log: Vec<&'static str>,
+            done: Receiver<()>,
+        }
+        impl GfxConsumer for Consumer {
+            fn consume_dl(
+                &mut self,
+                _: usize,
+                _: ultragfx::Microcode,
+                _: Option<crate::interpolation::Sidecar>,
+            ) {
+                self.log.push("task");
+            }
+            fn scanout(&mut self, _: u64, _: Instant) {
+                assert!(self.done.try_recv().is_ok());
+                self.log.push("commit");
+            }
+            fn present(&mut self, _: Option<u64>) {
+                panic!("interpolation issued a separate present");
+            }
+            fn resize(&mut self, _: u32, _: u32) {
+                self.log.push("resize");
+            }
+            fn original(&self) -> bool {
+                false
+            }
+        }
+        let (tx, rx) = channel();
+        let (done, rx_done) = channel();
+        tx.send(RenderMsg::Gfx {
+            data_ptr: 0,
+            microcode: ultragfx::Microcode::F3dex2,
+            sidecar: None,
+            done,
+        })
+        .unwrap();
+        tx.send(RenderMsg::Scanout {
+            address: 1,
+            enqueued_at: Instant::now(),
+        })
+        .unwrap();
+        tx.send(RenderMsg::Resize {
+            width: 320,
+            height: 240,
+        })
+        .unwrap();
+        tx.send(RenderMsg::Shutdown).unwrap();
+        let mut ctx = Consumer {
+            log: vec![],
+            done: rx_done,
+        };
+        render_loop_on(&mut ctx, rx);
+        assert_eq!(ctx.log, ["task", "commit", "resize"]);
     }
 }

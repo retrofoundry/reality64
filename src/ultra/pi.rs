@@ -170,7 +170,7 @@ mod tests {
     fn null_and_invalid_pointers_error() {
         let mq = fresh_queue(1);
         let mb = fresh_mb();
-        let dummy = 1usize as *mut c_void; // non-null; guards return before any deref
+        let dummy = ptr::dangling_mut::<c_void>(); // non-null; guards return before any deref
         assert_eq!(
             R64PiStartDma(ptr::null_mut(), 0, 1, dummy, 4, mq),
             -1,

@@ -379,7 +379,7 @@ mod tests {
         let q = fresh_queue(1);
         assert_eq!(
             R64EPiDma(
-                1 as *mut _,
+                ptr::dangling_mut(),
                 R64_DEV_DRIVE,
                 0xB000_0000,
                 0x1000_0000,

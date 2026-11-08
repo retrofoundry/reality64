@@ -26,8 +26,15 @@ pub fn cycles_from_nanos(nanos: u128, clock_rate: u64) -> u64 {
     (nanos * clock_rate as u128 / 1_000_000_000u128) as u64
 }
 
+fn now() -> Instant {
+    match super::vi::replay_nanos() {
+        Some(nanos) => epoch() + Duration::from_nanos(nanos),
+        None => Instant::now(),
+    }
+}
+
 fn now_cycles() -> u64 {
-    let nanos = epoch().elapsed().as_nanos();
+    let nanos = now().saturating_duration_since(epoch()).as_nanos();
     TIME_OFFSET
         .load(Ordering::Relaxed)
         .wrapping_add(cycles_from_nanos(nanos, OS_CPU_COUNTER))
@@ -47,7 +54,7 @@ pub extern "C" fn R64GetCount() -> u32 {
 #[no_mangle]
 pub extern "C" fn R64SetTime(t: u64) {
     // Re-bias so the next R64GetTime returns ~t (osSetTime semantics).
-    let nanos = epoch().elapsed().as_nanos();
+    let nanos = now().saturating_duration_since(epoch()).as_nanos();
     let elapsed = cycles_from_nanos(nanos, OS_CPU_COUNTER);
     TIME_OFFSET.store(t.wrapping_sub(elapsed), Ordering::Relaxed);
 }
@@ -104,6 +111,39 @@ fn countdown_loop() {
     }
 }
 
+fn start_thread() {
+    TIMER_THREAD.call_once(|| {
+        std::thread::Builder::new()
+            .name("reality64-timer".into())
+            .spawn(countdown_loop)
+            .expect("spawn timer thread");
+    });
+}
+
+pub(crate) fn service_replay() {
+    service(&mut ARMED.lock().unwrap(), now());
+}
+
+pub(crate) fn finish_replay() {
+    let virtual_now = epoch() + Duration::from_nanos(super::vi::replay_elapsed_nanos());
+    let host_now = Instant::now();
+    let mut armed = ARMED.lock().unwrap();
+    for timer in armed.iter_mut() {
+        timer.deadline = host_now + timer.deadline.saturating_duration_since(virtual_now);
+    }
+    let virtual_cycles = cycles_from_nanos(
+        virtual_now.saturating_duration_since(epoch()).as_nanos(),
+        OS_CPU_COUNTER,
+    );
+    let host_cycles = cycles_from_nanos(
+        host_now.saturating_duration_since(epoch()).as_nanos(),
+        OS_CPU_COUNTER,
+    );
+    TIME_OFFSET.fetch_add(virtual_cycles.wrapping_sub(host_cycles), Ordering::Relaxed);
+    drop(armed);
+    start_thread();
+}
+
 /// osSetTimer: post `msg` to `mq` after `countdown` COUNT cycles (`interval` when `countdown` is 0),
 /// then every `interval` cycles unless it is 0. Setting an armed timer re-arms it.
 #[no_mangle]
@@ -114,16 +154,13 @@ pub extern "C" fn R64SetTimer(
     mq: *mut c_void,
     msg: *mut c_void,
 ) -> i32 {
-    TIMER_THREAD.call_once(|| {
-        std::thread::Builder::new()
-            .name("reality64-timer".into())
-            .spawn(countdown_loop)
-            .expect("spawn timer thread");
-    });
+    if !crate::gamepad::script::replaying() {
+        start_thread();
+    }
     let value = if countdown != 0 { countdown } else { interval };
     let mut armed = ARMED.lock().unwrap();
     armed.retain(|c| c.timer != timer as usize);
-    if let Some(deadline) = Instant::now().checked_add(duration_from_cycles(value)) {
+    if let Some(deadline) = now().checked_add(duration_from_cycles(value)) {
         armed.push(Countdown {
             timer: timer as usize,
             deadline,

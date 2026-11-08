@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SchedEntry {
@@ -115,6 +115,28 @@ impl Scheduler {
         }
     }
 
+    fn dispatch<'a>(
+        &'a self,
+        mut g: MutexGuard<'a, SchedInner>,
+        replaying: bool,
+        mut idle: impl FnMut() -> bool,
+    ) -> MutexGuard<'a, SchedInner> {
+        let mut next = pick_next(&g.entries, g.running);
+        while replaying && next.is_none() && g.running.is_some() {
+            // Keep the run token while injecting: wake() must not start a guest mid-tick.
+            drop(g);
+            let advanced = idle();
+            g = self.inner.lock().unwrap();
+            next = pick_next(&g.entries, g.running);
+            if !advanced {
+                break;
+            }
+        }
+        g.running = next;
+        self.cv.notify_all();
+        g
+    }
+
     /// Register a created-but-not-started thread (osCreateThread): known, not yet runnable.
     pub fn register(&self, key: usize, pri: i32) {
         let mut g = self.inner.lock().unwrap();
@@ -151,8 +173,11 @@ impl Scheduler {
     /// token off and return without blocking.
     pub fn reschedule(&self, caller: Option<usize>) {
         let mut g = self.inner.lock().unwrap();
-        g.running = pick_next(&g.entries, g.running);
-        self.cv.notify_all();
+        g = self.dispatch(
+            g,
+            crate::gamepad::script::replaying(),
+            super::vi::step_replay,
+        );
         if let Some(me) = caller {
             while g.running != Some(me) {
                 g = self.cv.wait(g).unwrap();
@@ -226,8 +251,11 @@ impl Scheduler {
         if let Some(entry) = g.entries.get_mut(&key) {
             entry.ready = false;
         }
-        g.running = pick_next(&g.entries, None);
-        self.cv.notify_all();
+        drop(self.dispatch(
+            g,
+            crate::gamepad::script::replaying(),
+            super::vi::step_replay,
+        ));
         #[cfg(test)]
         TEST_EXITED.lock().unwrap().push(key);
     }
@@ -304,8 +332,11 @@ pub fn wake(id: usize) {
 pub fn park_self() {
     let me = current_id();
     let mut g = scheduler().inner.lock().unwrap();
-    g.running = pick_next(&g.entries, g.running);
-    scheduler().cv.notify_all();
+    g = scheduler().dispatch(
+        g,
+        crate::gamepad::script::replaying(),
+        super::vi::step_replay,
+    );
     while g.running != Some(me) {
         g = scheduler().cv.wait(g).unwrap();
     }
@@ -329,6 +360,42 @@ mod tests {
 
     fn e(pri: i32) -> SchedEntry {
         SchedEntry { pri, ready: true }
+    }
+
+    #[test]
+    fn replay_ticks_only_after_guest_work_drains() {
+        let s = Scheduler::new();
+        s.register(1, 10);
+        s.register(2, 100);
+        s.mark_ready(1);
+        let mut g = s.inner.lock().unwrap();
+        g.running = Some(1);
+        g = s.dispatch(g, true, || {
+            panic!("a runnable guest must prevent a retrace")
+        });
+        assert_eq!(g.running, Some(1));
+
+        g.entries.get_mut(&1).unwrap().ready = false;
+        let mut ticks = 0;
+        g = s.dispatch(g, true, || {
+            ticks += 1;
+            let mut inner = s.inner.lock().unwrap();
+            assert_eq!(inner.running, Some(1), "injection retains the run token");
+            if ticks == 3 {
+                inner.entries.get_mut(&2).unwrap().ready = true;
+            }
+            true
+        });
+        assert_eq!(ticks, 3);
+        assert_eq!(g.running, Some(2));
+        g = s.dispatch(g, true, || panic!("the retrace consumer must finish first"));
+        assert_eq!(g.running, Some(2));
+
+        g.entries.get_mut(&2).unwrap().ready = false;
+        g = s.dispatch(g, false, || {
+            panic!("ordinary idle must keep host-event ordering")
+        });
+        assert_eq!(g.running, None, "ordinary idle waits for a host event");
     }
 
     #[test]

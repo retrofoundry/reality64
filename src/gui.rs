@@ -94,6 +94,10 @@ impl<'a> Gui<'a> {
             surface,
             width: size.width.max(1),
             height: size.height.max(1),
+            display_millihz: window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+                .filter(|rate| *rate != 0),
         });
 
         self.window = Some(window);
@@ -116,6 +120,7 @@ impl<'a> Gui<'a> {
             WindowEvent::Resized(size) => {
                 self.forward_resize(size.width, size.height);
             }
+            WindowEvent::Moved(_) => self.forward_refresh_rate(),
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(w) = self.window.as_ref() {
                     let size = w.inner_size();
@@ -140,6 +145,7 @@ impl<'a> Gui<'a> {
     /// thread for a surface reconfigure. Ignores winit's transient `u32::MAX` size and a
     /// minimized (zero-dimension) window.
     fn forward_resize(&self, width: u32, height: u32) {
+        self.forward_refresh_rate();
         if crate::render::valid_surface_size(width, height).is_none() {
             return;
         }
@@ -148,6 +154,18 @@ impl<'a> Gui<'a> {
             width,
             height,
         });
+    }
+
+    fn forward_refresh_rate(&self) {
+        let millihz = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .filter(|rate| *rate != 0);
+        crate::ultra::rcp::send_render_control(crate::ultra::rcp::RenderMsg::DisplayRefreshRate(
+            millihz,
+        ));
     }
 
     /// Take the render-thread handle so the caller can send `RenderMsg::Shutdown` and join it.

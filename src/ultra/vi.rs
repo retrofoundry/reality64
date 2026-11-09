@@ -419,7 +419,10 @@ pub extern "C" fn R64ViSwapBuffer(fb: *mut c_void) {
             Arc::new(post_retrace),
         );
     }
-    super::rcp::send_render_control(super::rcp::RenderMsg::Scanout { address: fb as u64 });
+    super::rcp::send_render_control(super::rcp::RenderMsg::Scanout {
+        address: fb as u64,
+        enqueued_at: Instant::now(),
+    });
 }
 
 #[cfg(test)]

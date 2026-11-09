@@ -7,6 +7,7 @@ pub mod audio;
 pub mod gamepad;
 mod guest_memory;
 pub mod gui;
+mod interpolation;
 #[cfg(feature = "network")]
 pub mod network;
 pub mod render;

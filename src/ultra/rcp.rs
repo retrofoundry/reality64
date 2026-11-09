@@ -70,15 +70,18 @@ pub(crate) enum RenderMsg {
     Gfx {
         data_ptr: usize,
         microcode: ultragfx::Microcode,
+        sidecar: Option<crate::interpolation::Sidecar>,
         done: Sender<()>,
     },
     Scanout {
         address: u64,
+        enqueued_at: std::time::Instant,
     },
     Resize {
         width: u32,
         height: u32,
     },
+    DisplayRefreshRate(Option<u32>),
     Shutdown,
 }
 
@@ -112,13 +115,18 @@ pub(crate) fn take_render_receiver() -> Receiver<RenderMsg> {
 /// Submit a DL and block (run token held) until the consumer consumes it. `true` on consume, `false`
 /// if the render thread is gone — the caller then skips completion so a dead consumer never yields a
 /// false SP→DP.
-pub(crate) fn submit_and_wait(data_ptr: usize, microcode: ultragfx::Microcode) -> bool {
+pub(crate) fn submit_and_wait(
+    data_ptr: usize,
+    microcode: ultragfx::Microcode,
+    sidecar: Option<crate::interpolation::Sidecar>,
+) -> bool {
     let (done_tx, done_rx) = channel::<()>();
     if gfx()
         .tx
         .send(RenderMsg::Gfx {
             data_ptr,
             microcode,
+            sidecar,
             done: done_tx,
         })
         .is_err()
@@ -146,7 +154,11 @@ pub extern "C" fn R64SpTaskStartGo(task: *mut c_void) {
     });
     match handler {
         Handler::Gfx(microcode) => {
-            if submit_and_wait(data_ptr, microcode) {
+            if submit_and_wait(
+                data_ptr,
+                microcode,
+                crate::interpolation::take(task as usize),
+            ) {
                 post_gfx_completion();
             }
         }
@@ -206,6 +218,7 @@ mod tests {
                     data_ptr,
                     microcode,
                     done,
+                    ..
                 } => {
                     assert_eq!(data_ptr, 0xDEAD_BEEF, "data_ptr must round-trip intact");
                     assert_eq!(microcode, ultragfx::Microcode::S2dex2);
@@ -230,7 +243,7 @@ mod tests {
         rx_ready.recv().unwrap();
         consumer.join().unwrap();
         assert!(
-            !submit_and_wait(0x1234, ultragfx::Microcode::F3d),
+            !submit_and_wait(0x1234, ultragfx::Microcode::F3d, None),
             "receiver dropped → render gone → false, no hang"
         );
     }

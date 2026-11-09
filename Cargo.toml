@@ -31,7 +31,7 @@ wgpu = { version = "29" }
 spin_sleep = "1.1.1"
 arie = "0.3.0"
 # Pinned: ultragfx may change its API between commits; bump this deliberately and fix up the render path with it.
-ultragfx = { git = "https://github.com/retrofoundry/ultragfx", rev = "e0843f9531ec07fd60a143b48516531424fc94cf", default-features = false, features = ["capture"] }
+ultragfx = { git = "https://github.com/retrofoundry/ultragfx", rev = "7b79cfbc87cc3472b3eb974b3bc237cfee7d790b", default-features = false, features = ["capture"] }
 rustc-hash = "1.1.0"
 sha2 = "0.10"
 

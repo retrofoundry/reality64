@@ -4,6 +4,9 @@
 `R64InterpolationRegister(R64_INTERPOLATION_ABI_VERSION)` once at startup. It returns
 zero on success or -1 with an error diagnostic on an ABI mismatch. Check that result.
 
+This C sidecar version is independent of ultragfx's Rust annotation ABI 3. The adapter
+uses invocation scopes without composed views; no C layout or caller changes are needed.
+
 Initialize `R64TaskAnnotations` with `R64_TASK_ANNOTATIONS_INIT`, then set `source`,
 `epoch`, `producer_sample`, `draws` and `draw_count`. Attach it to the graphics
 `OSTask*` with `R64InterpolationAttach(task, &annotations)` before

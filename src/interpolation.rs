@@ -4,6 +4,8 @@ use std::mem::{align_of, size_of};
 use std::sync::{Mutex, OnceLock};
 use ultragfx::annotation::*;
 
+const SIDECAR_ABI_VERSION: u32 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct R64DrawIdentity {
@@ -96,8 +98,8 @@ fn registry() -> &'static Mutex<Registry> {
 
 fn version(version: u32) -> anyhow::Result<()> {
     anyhow::ensure!(
-        version == ANNOTATION_ABI_VERSION,
-        "annotation ABI {version}, expected {ANNOTATION_ABI_VERSION}"
+        version == SIDECAR_ABI_VERSION,
+        "annotation ABI {version}, expected {SIDECAR_ABI_VERSION}"
     );
     Ok(())
 }
@@ -233,10 +235,11 @@ unsafe fn convert(input: *const R64TaskAnnotations) -> anyhow::Result<Sidecar> {
             })
         };
         sidecar.annotations.draws.push(DrawAnnotation {
-            scope: InvocationSelector {
+            scope: ScopeSelector::Invocation(InvocationSelector {
                 address: draw.scope.address as u64,
                 occurrence: (draw.scope.has_occurrence == 1).then_some(draw.scope.occurrence),
-            },
+            }),
+            composed_view: None,
             identity: DrawIdentity {
                 namespace: draw.identity.namespace_id,
                 instance: draw.identity.instance,
@@ -333,7 +336,7 @@ mod tests {
 
     fn empty() -> R64TaskAnnotations {
         R64TaskAnnotations {
-            version: ANNOTATION_ABI_VERSION,
+            version: SIDECAR_ABI_VERSION,
             flags: 0,
             struct_size: size_of::<R64TaskAnnotations>(),
             draw_size: size_of::<R64DrawAnnotation>(),
@@ -379,7 +382,7 @@ mod tests {
             size: usize,
         }
         let short = Short {
-            version: ANNOTATION_ABI_VERSION,
+            version: SIDECAR_ABI_VERSION,
             flags: 0,
             size: size_of::<Short>(),
         };
@@ -437,11 +440,12 @@ mod tests {
         let result = &result.annotations.draws[0];
         assert_eq!(
             result.scope,
-            InvocationSelector {
+            ScopeSelector::Invocation(InvocationSelector {
                 address: 0x234567890,
                 occurrence: Some(3)
-            }
+            })
         );
+        assert_eq!(result.composed_view, None);
         assert_eq!(
             result.identity,
             DrawIdentity {
@@ -473,8 +477,8 @@ mod tests {
 
     #[test]
     fn attachment_is_owned_and_consumed_once() {
-        assert_eq!(R64InterpolationRegister(ANNOTATION_ABI_VERSION + 1), -1);
-        assert_eq!(R64InterpolationRegister(ANNOTATION_ABI_VERSION), 0);
+        assert_eq!(R64InterpolationRegister(3), -1);
+        assert_eq!(R64InterpolationRegister(2), 0);
         let task = 0x1_3456_7890usize as *const c_void;
         let mut input = empty();
         assert_eq!(R64InterpolationAttach(task, &input), 0);

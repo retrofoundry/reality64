@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::ultra::event::{self, OS_EVENT_DP, OS_EVENT_SP};
 use crate::ultra::rsp::{self, Handler};
 
-use super::acmd::native::NativeContext;
+use super::acmd::{native::NativeContext, Microcode};
 
 const M_GFXTASK: u32 = 1;
 
@@ -162,14 +162,20 @@ pub extern "C" fn R64SpTaskStartGo(task: *mut c_void) {
                 post_gfx_completion();
             }
         }
-        Handler::AudioAcmd => {
+        Handler::AudioAcmd | Handler::AudioZelda => {
             static AUDIO: OnceLock<Mutex<NativeContext>> = OnceLock::new();
-            let mut context = AUDIO
-                .get_or_init(|| Mutex::new(NativeContext::default()))
+            static ZELDA: OnceLock<Mutex<NativeContext>> = OnceLock::new();
+            let (context, microcode) = if handler == Handler::AudioAcmd {
+                (&AUDIO, Microcode::Classic)
+            } else {
+                (&ZELDA, Microcode::Zelda)
+            };
+            let mut context = context
+                .get_or_init(|| Mutex::new(NativeContext::new(microcode)))
                 .lock()
                 .unwrap();
             if let Err(error) = unsafe { context.task(task) } {
-                log::error!("classic audio task rejected: {error}");
+                log::error!("{handler:?} audio task rejected: {error}");
             }
             // The post can hand the token to a thread that starts the next audio task.
             drop(context);

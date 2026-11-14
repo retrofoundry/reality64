@@ -50,6 +50,13 @@ impl Dma {
 
 pub(super) trait Memory {
     fn resolve<O: HalfwordOrder>(&mut self, dmem: &Dmem<O>, word: u64) -> Result<u32, String>;
+    fn resolve_zelda<O: HalfwordOrder>(
+        &mut self,
+        dmem: &Dmem<O>,
+        word: u64,
+    ) -> Result<u32, String> {
+        self.resolve(dmem, word)
+    }
     fn dma<O: HalfwordOrder>(
         &mut self,
         dmem: &mut Dmem<O>,
@@ -64,6 +71,14 @@ impl Memory for [u8] {
     fn resolve<O: HalfwordOrder>(&mut self, dmem: &Dmem<O>, word: u64) -> Result<u32, String> {
         let word = word as u32;
         Ok((word & 0xffffff).wrapping_add(dmem.word(SEGMENT_TABLE + (word >> 24) * 4)))
+    }
+
+    fn resolve_zelda<O: HalfwordOrder>(
+        &mut self,
+        _dmem: &Dmem<O>,
+        word: u64,
+    ) -> Result<u32, String> {
+        Ok(word as u32 & 0xffffff)
     }
 
     fn dma<O: HalfwordOrder>(

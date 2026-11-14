@@ -1,10 +1,11 @@
-//! Classic US aspMain, with caller-owned state and console or native memory.
+//! Audio aspMain handlers with caller-owned state and console or native memory.
 
 mod classic;
 mod dmem;
 mod mem;
 pub mod native;
 mod vector;
+mod zelda;
 
 use dmem::{Be, Dmem, HalfwordOrder};
 use mem::Memory;
@@ -35,6 +36,13 @@ const TASK_DATA: usize = 28;
 const NEXT_COMMAND: usize = 29;
 const CHUNK_REMAINING: usize = 30;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Microcode {
+    #[default]
+    Classic,
+    Zelda,
+}
+
 pub struct Context<O: HalfwordOrder = Be> {
     pub dmem: Dmem<O>,
     pub vectors: [[u16; 8]; 32],
@@ -60,14 +68,30 @@ impl<O: HalfwordOrder> Default for Context<O> {
 impl Context<Be> {
     #[allow(dead_code, reason = "Used by the offline console oracle bridge.")]
     pub fn console_task(&mut self, ram: &mut [u8], task: &[u32; 16]) -> Result<(), String> {
+        self.console_task_for(ram, task, Microcode::Classic)
+    }
+
+    fn console_task_for(
+        &mut self,
+        ram: &mut [u8],
+        task: &[u32; 16],
+        microcode: Microcode,
+    ) -> Result<(), String> {
         for (i, &word) in task.iter().enumerate() {
             self.dmem.set_word(TASK_DESCRIPTOR + i as u32 * 4, word);
         }
         self.dma(ram, 0, task[6], task[7].wrapping_sub(1), false)?;
+        let dispatch = if microcode == Microcode::Zelda {
+            self.zelda_start()
+        } else {
+            [0; 26]
+        };
         self.scalar[TASK_DATA] = self.dmem.word(TASK_DESCRIPTOR + 0x30);
         self.scalar[TASK_DATA_SIZE] = self.dmem.word(TASK_DESCRIPTOR + 0x34);
-        self.stage(ram)?;
-        self.dmem.set_word(SEGMENT_TABLE, 0);
+        self.stage(ram, microcode)?;
+        if microcode == Microcode::Classic {
+            self.dmem.set_word(SEGMENT_TABLE, 0);
+        }
         loop {
             let address = self.scalar[NEXT_COMMAND];
             let w0 = self.dmem.word(address);
@@ -76,29 +100,36 @@ impl Context<Be> {
             self.scalar[TASK_DATA_SIZE] = self.scalar[TASK_DATA_SIZE].wrapping_sub(8);
             self.scalar[NEXT_COMMAND] += 8;
             self.scalar[CHUNK_REMAINING] = self.scalar[CHUNK_REMAINING].wrapping_sub(8);
-            self.command(ram, w0, u64::from(w1))?;
+            match microcode {
+                Microcode::Classic => self.command(ram, w0, u64::from(w1))?,
+                Microcode::Zelda => self.zelda_command(ram, w0, u64::from(w1), &dispatch)?,
+            }
             if self.scalar[CHUNK_REMAINING] as i32 > 0 {
                 continue;
             }
             if self.scalar[TASK_DATA_SIZE] as i32 <= 0 {
                 break;
             }
-            self.stage(ram)?;
+            self.stage(ram, microcode)?;
         }
         Ok(())
     }
 
-    fn stage(&mut self, ram: &mut [u8]) -> Result<(), String> {
-        let count = self.scalar[TASK_DATA_SIZE].min(ADPCM_TABLE - NEXT_TASK_ENTRY);
+    fn stage(&mut self, ram: &mut [u8], microcode: Microcode) -> Result<(), String> {
+        let (start, capacity) = match microcode {
+            Microcode::Classic => (NEXT_TASK_ENTRY, ADPCM_TABLE - NEXT_TASK_ENTRY),
+            Microcode::Zelda => (0x2f0, 64),
+        };
+        let count = self.scalar[TASK_DATA_SIZE].min(capacity);
         self.dma(
             ram,
-            NEXT_TASK_ENTRY,
+            start,
             self.scalar[TASK_DATA],
             count.wrapping_sub(1),
             false,
         )?;
         self.scalar[CHUNK_REMAINING] = count;
-        self.scalar[NEXT_COMMAND] = NEXT_TASK_ENTRY;
+        self.scalar[NEXT_COMMAND] = start;
         Ok(())
     }
 }

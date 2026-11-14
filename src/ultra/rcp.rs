@@ -169,8 +169,7 @@ pub extern "C" fn R64SpTaskStartGo(task: *mut c_void) {
                 .lock()
                 .unwrap();
             if let Err(error) = unsafe { context.task(task) } {
-                log::error!("classic audio task failed: {error}");
-                std::process::abort();
+                log::error!("classic audio task rejected: {error}");
             }
             // The post can hand the token to a thread that starts the next audio task.
             drop(context);

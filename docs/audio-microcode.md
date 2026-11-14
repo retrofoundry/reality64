@@ -16,7 +16,7 @@ Link the real `aspMain` data section and point `OSTask.t.ucode_data` at it, with
 `ucode_data_size` set to its length. The handler reads its tables from there, the way the RSP
 loads them at the start of each task, so reality64 itself contains no microcode. Generate the data
 at build time from the game's own sources or ROM; don't commit it. A missing or different data
-section aborts with a message naming the revision reality64 expected.
+section rejects the task with a message naming the revision reality64 expected.
 
 Commands are reality64's native `Acmd` packets: two 64-bit words, with full host pointers wherever
 the console command carries an RDRAM address.
@@ -31,10 +31,15 @@ also cover those rounded extents.
 Tasks run synchronously on the calling guest thread and keep their state between tasks. A loop
 or state buffer the game hands to one task must stay alive while later tasks can use it.
 
+A task that fails stops at the failing command and is still completed, so the game keeps running;
+its error is logged. Output the task wrote before that command stays in place. One such failure is
+a DMA whose length counts down below zero: the register value then means 256 rows of 4 KB with a
+4095-byte skip, which the console carries out and the native path refuses.
+
 ## How it was checked
 
 The handlers were checked against the microcode itself, running on a real N64 and in an
 interpreter that matches the console byte for byte. Synthetic tasks cover every command's
 boundaries; real command lists captured from the game cover ordinary play. Byte-level operations
-at odd addresses on 16-bit data are the one place the native representation can differ from the
-console, and no game we know of issues them.
+at odd addresses on 16-bit data are one place the native representation can differ from the
+console, and no game we know of issues them. The other is the refused underflowing DMA above.

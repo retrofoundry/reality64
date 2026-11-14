@@ -118,12 +118,11 @@ impl Scheduler {
     fn dispatch<'a>(
         &'a self,
         mut g: MutexGuard<'a, SchedInner>,
-        replaying: bool,
         mut idle: impl FnMut() -> bool,
     ) -> MutexGuard<'a, SchedInner> {
         let mut next = pick_next(&g.entries, g.running);
-        while replaying && next.is_none() && g.running.is_some() {
-            // Keep the run token while injecting: wake() must not start a guest mid-tick.
+        while next.is_none() && g.running.is_some() {
+            // Keep the run token while injecting: wake() must not start a guest mid-step.
             drop(g);
             let advanced = idle();
             g = self.inner.lock().unwrap();
@@ -173,11 +172,7 @@ impl Scheduler {
     /// token off and return without blocking.
     pub fn reschedule(&self, caller: Option<usize>) {
         let mut g = self.inner.lock().unwrap();
-        g = self.dispatch(
-            g,
-            crate::gamepad::script::replaying(),
-            super::vi::step_replay,
-        );
+        g = self.dispatch(g, idle_step);
         if let Some(me) = caller {
             while g.running != Some(me) {
                 g = self.cv.wait(g).unwrap();
@@ -262,11 +257,7 @@ impl Scheduler {
         if let Some(entry) = g.entries.get_mut(&key) {
             entry.ready = false;
         }
-        drop(self.dispatch(
-            g,
-            crate::gamepad::script::replaying(),
-            super::vi::step_replay,
-        ));
+        drop(self.dispatch(g, idle_step));
         #[cfg(test)]
         TEST_EXITED.lock().unwrap().push(key);
     }
@@ -276,6 +267,12 @@ impl Default for Scheduler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What happens when no guest is ready: the next PI transfer completes, else replay steps a
+/// retrace. Returns whether either woke anything that could run.
+fn idle_step() -> bool {
+    super::pi::complete_next() || super::vi::step_replay()
 }
 
 static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
@@ -343,11 +340,7 @@ pub fn wake(id: usize) {
 pub fn park_self() {
     let me = current_id();
     let mut g = scheduler().inner.lock().unwrap();
-    g = scheduler().dispatch(
-        g,
-        crate::gamepad::script::replaying(),
-        super::vi::step_replay,
-    );
+    g = scheduler().dispatch(g, idle_step);
     while g.running != Some(me) {
         g = scheduler().cv.wait(g).unwrap();
     }
@@ -381,14 +374,12 @@ mod tests {
         s.mark_ready(1);
         let mut g = s.inner.lock().unwrap();
         g.running = Some(1);
-        g = s.dispatch(g, true, || {
-            panic!("a runnable guest must prevent a retrace")
-        });
+        g = s.dispatch(g, || panic!("a runnable guest must prevent a retrace"));
         assert_eq!(g.running, Some(1));
 
         g.entries.get_mut(&1).unwrap().ready = false;
         let mut ticks = 0;
-        g = s.dispatch(g, true, || {
+        g = s.dispatch(g, || {
             ticks += 1;
             let mut inner = s.inner.lock().unwrap();
             assert_eq!(inner.running, Some(1), "injection retains the run token");
@@ -399,14 +390,15 @@ mod tests {
         });
         assert_eq!(ticks, 3);
         assert_eq!(g.running, Some(2));
-        g = s.dispatch(g, true, || panic!("the retrace consumer must finish first"));
+        g = s.dispatch(g, || panic!("the retrace consumer must finish first"));
         assert_eq!(g.running, Some(2));
 
         g.entries.get_mut(&2).unwrap().ready = false;
-        g = s.dispatch(g, false, || {
-            panic!("ordinary idle must keep host-event ordering")
-        });
-        assert_eq!(g.running, None, "ordinary idle waits for a host event");
+        g = s.dispatch(g, || false);
+        assert_eq!(
+            g.running, None,
+            "an idle step that wakes nothing waits for a host event"
+        );
     }
 
     #[test]

@@ -21,5 +21,5 @@ s32 osPiStartDma(OSIoMesg *mb, __attribute__((unused)) s32 priority, s32 directi
 
 void osCreatePiManager(__attribute__((unused)) s32 pri, __attribute__((unused)) OSMesgQueue *cmdQ,
                         __attribute__((unused)) OSMesg *cmdBuf, __attribute__((unused)) s32 cmdMsgCnt) {
-    // Synchronous DMA (R64PiStartDma) needs no PI worker thread.
+    // The scheduler completes transfers (src/ultra/pi.rs), so no PI manager thread runs.
 }

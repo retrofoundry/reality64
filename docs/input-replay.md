@@ -24,7 +24,11 @@ Each step advances one NTSC/MPAL or PAL retrace, services guest timers, then pos
 VI with the registered divisor. The scheduler retains the run token while
 injecting events and drains runnable guest work before advancing again. Input
 still changes at swaps, so the retrace that samples a change follows guest
-progress.
+progress. PI DMA takes no virtual time: the oldest pending transfer completes at
+each guest message send or receive and before each step, one transfer at a time.
+This stands in for the PI interrupt, so it arrives early when a message call
+follows the request sooner than the cart would deliver, and late when a guest runs
+a long stretch without one.
 
 `osGetTime` and `osGetCount` read this virtual clock; time does not advance while
 guest code or a synchronous graphics task is running. Timers fire at the first

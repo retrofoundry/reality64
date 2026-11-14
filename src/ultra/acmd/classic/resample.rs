@@ -7,7 +7,7 @@ const RESAMPLE_INPUT_REG: usize = 17;
 const RESAMPLE_COEFFICIENT_REG: usize = 9;
 
 impl<O: HalfwordOrder> Context<O> {
-    fn resample_addresses(&mut self) {
+    pub(in crate::ultra::acmd) fn resample_addresses(&mut self) {
         let phase = i64::from(self.vectors[23][7]);
         let integral = signed(self.vectors[22][7]) << 16;
         for i in 0..8 {
@@ -25,14 +25,14 @@ impl<O: HalfwordOrder> Context<O> {
         }
     }
 
-    fn resample_scratch(&mut self) {
-        self.store_quad(21, TMP_DATA + 0x20);
-        self.store_quad(17, TMP_DATA + 0x30);
+    pub(in crate::ultra::acmd) fn resample_scratch(&mut self, scratch: u32) {
+        self.store_quad(21, scratch + 0x20);
+        self.store_quad(17, scratch + 0x30);
         for i in 0..8 {
             self.scalar[RESAMPLE_INPUT_REG - i] =
-                self.dmem.h16(TMP_DATA + 0x20 + i as u32 * 2) as i16 as u32;
+                self.dmem.h16(scratch + 0x20 + i as u32 * 2) as i16 as u32;
             self.scalar[RESAMPLE_COEFFICIENT_REG - i] =
-                self.dmem.h16(TMP_DATA + 0x30 + i as u32 * 2) as i16 as u32;
+                self.dmem.h16(scratch + 0x30 + i as u32 * 2) as i16 as u32;
         }
     }
 
@@ -84,7 +84,7 @@ impl<O: HalfwordOrder> Context<O> {
         self.vectors[22] = [0; 8];
         self.resample_addresses();
         self.load_quad(25, 0x40);
-        self.resample_scratch();
+        self.resample_scratch(TMP_DATA);
         self.store(23, 7, TMP_DATA + 8, 2);
         loop {
             for i in 0..4 {
@@ -116,7 +116,7 @@ impl<O: HalfwordOrder> Context<O> {
                 self.vectors[8 - i] =
                     std::array::from_fn(|j| sat(signed(pairs[j]) + signed(pairs[(j & 4) + 2])));
             }
-            self.resample_scratch();
+            self.resample_scratch(TMP_DATA);
             self.vectors[4] = std::array::from_fn(|i| {
                 let group = i & 4;
                 low((0..4)

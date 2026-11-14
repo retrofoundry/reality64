@@ -11,6 +11,7 @@ pub struct R64RspBinding {
 pub(crate) enum Handler {
     Gfx(ultragfx::Microcode),
     AudioAcmd,
+    AudioZelda,
     JpegNjpgdsp,
     Skip,
 }
@@ -66,6 +67,7 @@ fn register(registry: &OnceLock<Registry>, bindings: &[R64RspBinding]) -> Result
             6 => Handler::JpegNjpgdsp,
             7 => Handler::Skip,
             8 => Handler::Gfx(ultragfx::Microcode::F3dzexNoN),
+            9 => Handler::AudioZelda,
             _ => return Err(()),
         };
         validated.bindings.push((address, handler));
@@ -116,7 +118,7 @@ mod tests {
         for invalid in [
             vec![binding(0, 1)],
             vec![binding(0x1_1234_5678, 0)],
-            vec![binding(0x1_1234_5678, 9)],
+            vec![binding(0x1_1234_5678, 10)],
             vec![binding(0x1_1234_5678, 1), binding(0x1_1234_5678, 2)],
             vec![binding(0x1_1234_5678, 1), binding(0x9234_5678, 2)],
             vec![binding(0x9234_5678, 2), binding(0x1_1234_5678, 1)],
@@ -158,8 +160,9 @@ mod tests {
             Handler::JpegNjpgdsp,
             Handler::Skip,
             Handler::Gfx(ultragfx::Microcode::F3dzexNoN),
+            Handler::AudioZelda,
         ];
-        let bindings: Vec<_> = (1..=8)
+        let bindings: Vec<_> = (1..=9)
             .map(|id| binding(0x1000 + id as usize * 8, id))
             .collect();
         assert_eq!(register(&registry, &bindings), Ok(()));

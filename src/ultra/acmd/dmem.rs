@@ -68,7 +68,6 @@ impl<O: HalfwordOrder> Dmem<O> {
         self.set_h16(address.wrapping_add(2), value as u16);
     }
 
-    #[cfg(test)]
     pub fn table_byte(&self, address: u32) -> u8 {
         (self.h16(address & !1) >> (8 * (1 - (address & 1)))) as u8
     }

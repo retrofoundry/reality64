@@ -168,6 +168,26 @@ fn task_startup_and_forty_command_refills() {
 }
 
 #[test]
+fn zelda_console_task_resets_the_fallthrough_sample_phase() {
+    let mut c = Context::<Be>::default();
+    let mut ram = vec![0; 0x1000];
+    ram[..4].copy_from_slice(&[0x11, 0x11, 0x22, 0x22]);
+    ram[0x100..0x104].copy_from_slice(&0x19000000u32.to_be_bytes());
+    let mut task = [0; 16];
+    task[7] = 8;
+    task[12] = 0x100;
+    task[13] = 8;
+    for _ in 0..2 {
+        c.scalar[12] = 0x7e00;
+        c.scalar[13] = 16;
+        c.scalar[15] = 0x900;
+        c.console_task_for(&mut ram, &task, Microcode::Zelda)
+            .unwrap();
+        assert_eq!(c.dmem.h16(0x910), 0x2222);
+    }
+}
+
+#[test]
 fn parameter_commands_alias_the_loop_word_and_preserve_main_buffers() {
     let mut c = Context::<Be>::default();
     let mut ram = [];

@@ -1,5 +1,5 @@
 use super::native::NativeContext;
-use super::Context;
+use super::{Context, Microcode};
 use crate::ultra::rcp::OSTaskT;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -46,10 +46,16 @@ fn console_oracle() {
     let build = std::env::var_os("REALITY64_AUDIO_ORACLE_BUILD")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| suite.parent().unwrap().to_owned());
+    let game = std::env::var("REALITY64_AUDIO_ORACLE_GAME").unwrap_or_else(|_| "sm64".into());
+    let microcode = match game.as_str() {
+        "sm64" => Microcode::Classic,
+        "oot" => Microcode::Zelda,
+        _ => panic!("REALITY64_AUDIO_ORACLE_GAME must be sm64 or oot"),
+    };
     let runs = read_json(&suite.join("runs.json"));
     let mut total = 0;
     for run in runs.as_array().unwrap() {
-        if number(&run["games"]["sm64"]) == 0 {
+        if number(&run["games"][&game]) == 0 {
             continue;
         }
         let name = run["run"].as_str().unwrap();
@@ -63,7 +69,7 @@ fn console_oracle() {
         let mut context = Context::default();
         let mut records = Vec::new();
         for case in manifest["cases"].as_array().unwrap() {
-            if case["game"] != "sm64" {
+            if case["game"] != game {
                 continue;
             }
             if case["reset"].as_bool().unwrap() {
@@ -78,8 +84,11 @@ fn console_oracle() {
             let commands = hex(&case["commands"]);
             ram[0x203000..0x203000 + commands.len()].copy_from_slice(&commands);
             for (kind, address) in [("text", 0x200000), ("data", 0x201000), ("boot", 0x202000)] {
-                let blob_name = format!("sm64-{kind}");
+                let blob_name = format!("{game}-{kind}");
                 let spec = &manifest["blobs"][&blob_name];
+                if spec.is_null() {
+                    continue;
+                }
                 let mut blob = fs::read(build.join(format!("{blob_name}.bin"))).unwrap();
                 assert!(
                     hash(&blob) == spec["sha256"].as_str().unwrap(),
@@ -92,12 +101,25 @@ fn console_oracle() {
             let task = [
                 2,
                 0,
-                0x202000,
-                number(&manifest["blobs"]["sm64-boot"]["size"]) as u32,
+                if microcode == Microcode::Classic {
+                    0x202000
+                } else {
+                    0x200000
+                },
+                if microcode == Microcode::Classic {
+                    number(&manifest["blobs"]["sm64-boot"]["size"]) as u32
+                } else {
+                    0x1000
+                },
                 0x200000,
-                0x800,
+                if microcode == Microcode::Classic {
+                    0x800
+                } else {
+                    0x1000
+                },
                 0x201000,
-                number(&manifest["blobs"]["sm64-data"]["size"]) as u32,
+                number(&manifest["blobs"][&format!("{game}-data")]["size"]) as u32
+                    - u32::from(microcode == Microcode::Zelda),
                 0,
                 0,
                 0,
@@ -111,7 +133,7 @@ fn console_oracle() {
                 ram[0x20f000 + 4 * i..0x20f004 + 4 * i].copy_from_slice(&word.to_be_bytes());
             }
             context
-                .console_task(&mut ram, &task)
+                .console_task_for(&mut ram, &task, microcode)
                 .unwrap_or_else(|error| panic!("{}: {error}", case["id"]));
             let mut bytes = Vec::new();
             for region in case["regions"].as_array().unwrap() {
@@ -139,7 +161,7 @@ fn console_oracle() {
         .unwrap();
     }
     assert!(total > 0);
-    eprintln!("wrote {total} classic oracle results");
+    eprintln!("wrote {total} {game} oracle results");
 }
 
 fn swap(bytes: &mut [u8]) {
@@ -185,17 +207,23 @@ fn native_oracle() {
     let recipe = Path::new(&recipe);
     let manifest = read_json(&recipe.join("recipe.json"));
     let build = Path::new(manifest["build"].as_str().unwrap());
-    let data = fs::read(build.join("sm64-data.bin")).unwrap();
+    let game = manifest["game"].as_str().unwrap_or("sm64");
+    let microcode = match game {
+        "sm64" => Microcode::Classic,
+        "oot" => Microcode::Zelda,
+        _ => panic!("unsupported native recipe game {game}"),
+    };
+    let data = fs::read(build.join(format!("{game}-data.bin"))).unwrap();
     let mut storage = vec![0; 0x10000 + 7];
     let alignment = storage.as_ptr().align_offset(8);
     let arena = &mut storage[alignment..alignment + 0x10000];
     let base = arena.as_mut_ptr() as usize;
     assert_eq!(base & 7, 0);
-    let mut context = NativeContext::default();
+    let mut context = NativeContext::new(microcode);
     let mut residues = [false; 8];
     for case in manifest["cases"].as_array().unwrap() {
         if case["reset"].as_bool().unwrap() {
-            context = NativeContext::default();
+            context = NativeContext::new(microcode);
             arena.fill(0);
         }
         for input in case["inputs"].as_array().unwrap() {
@@ -207,7 +235,10 @@ fn native_oracle() {
             arena[start..start + bytes.len()].copy_from_slice(&bytes);
         }
         for (kind, offset) in [("text", 0), ("data", 0x1000), ("boot", 0x2000)] {
-            let mut bytes = fs::read(build.join(format!("sm64-{kind}.bin"))).unwrap();
+            if microcode == Microcode::Zelda && kind == "boot" {
+                continue;
+            }
+            let mut bytes = fs::read(build.join(format!("{game}-{kind}.bin"))).unwrap();
             if kind == "data" {
                 swap(&mut bytes);
             }
@@ -232,7 +263,7 @@ fn native_oracle() {
         let task = OSTaskT {
             type_: 2,
             ucode_data: data.as_ptr() as *mut u64,
-            ucode_data_size: data.len() as u32,
+            ucode_data_size: data.len() as u32 - u32::from(microcode == Microcode::Zelda),
             data_ptr: packets.as_ptr() as *mut u64,
             data_size: (packets.len() * 16) as u32,
             ..OSTaskT::default()
@@ -267,7 +298,7 @@ fn native_oracle() {
     )
     .unwrap();
     eprintln!(
-        "wrote {} native classic results",
+        "wrote {} native {game} results",
         manifest["cases"].as_array().unwrap().len()
     );
 }

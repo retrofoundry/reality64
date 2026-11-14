@@ -30,6 +30,7 @@ typedef enum {
     R64_RSP_JPEG_NJPGDSP = 6, /* Ocarina of Time's njpgdspMain, RGBA5551 output */
     R64_RSP_SKIP = 7,         /* complete the task without running anything */
     R64_RSP_GFX_F3DZEX_NON = 8, /* F3DZEX NoN: like F3DEX2 NoN, but G_BRANCH_Z tests W */
+    R64_RSP_AUDIO_ZELDA = 9,    /* Zelda aspMain NTSC 1.0; 736-byte raw data, task data size 735 */
 } R64RspHandler;
 
 typedef struct {

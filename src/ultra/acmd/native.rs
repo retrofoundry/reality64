@@ -1,7 +1,6 @@
 use super::dmem::{Dmem, HalfwordOrder, Ne};
 use super::mem::{Dma, Memory};
-use super::Context;
-use super::SEGMENT_TABLE;
+use super::{Context, Microcode, CHUNK_REMAINING, SEGMENT_TABLE, TASK_DATA_SIZE};
 use crate::ultra::rcp::OSTaskT;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -96,19 +95,28 @@ impl Memory for HostMemory {
 pub struct NativeContext {
     pub state: Context<Ne>,
     memory: HostMemory,
+    microcode: Microcode,
 }
 
 impl NativeContext {
+    pub(in crate::ultra) fn new(microcode: Microcode) -> Self {
+        Self {
+            microcode,
+            ..Self::default()
+        }
+    }
+
     #[allow(dead_code, reason = "Used by the offline native oracle bridge.")]
     pub fn retained_address(&self, token: u32) -> Result<usize, String> {
         self.memory.tokens.address(token)
     }
 
-    /// Execute a native classic task synchronously. On error the task stops at the failing command.
+    /// Execute a native audio task synchronously. On error the task stops at the failing command.
     ///
     /// # Safety
     /// `task` must point to a live host OSTask. Its data payload must be readable for
-    /// `ucode_data_size` bytes, and its list for `data_size / 16` native packets.
+    /// the supported revision's full data extent (736 bytes for Zelda, whose task
+    /// size field is 735), and its list for `data_size / 16` native packets.
     /// Every command address must support the microcode's rounded DMA reads/writes,
     /// including address truncation, rows and skips, without aliasing this context.
     /// Retained addresses must stay live while later tasks can use their DMEM tokens.
@@ -121,12 +129,23 @@ impl NativeContext {
             return Err("native audio requires 16-byte packets with 64-bit words".into());
         }
         let task = unsafe { (task as *const OSTaskT).read_unaligned() };
-        if task.ucode_data_size as usize != DATA_SIZE || task.ucode_data.is_null() {
-            return Err(format!("expected {REVISION} data: {DATA_SIZE} raw bytes"));
+        let (revision, extent, task_size, hash) = match self.microcode {
+            Microcode::Classic => (REVISION, DATA_SIZE, DATA_SIZE, DATA_SHA256),
+            Microcode::Zelda => (
+                "Zelda aspMain (NTSC 1.0)",
+                736,
+                735,
+                "7a2773900752702bd70e073813f6e57601a9c1c741b07057799bd882eaa10e27",
+            ),
+        };
+        if task.ucode_data_size as usize != task_size || task.ucode_data.is_null() {
+            return Err(format!(
+                "expected {revision} data: {extent} raw bytes, task size {task_size}"
+            ));
         }
-        let data = unsafe { std::slice::from_raw_parts(task.ucode_data.cast::<u8>(), DATA_SIZE) };
-        if format!("{:x}", Sha256::digest(data)) != DATA_SHA256 {
-            return Err(format!("expected {REVISION} data: SHA-256 {DATA_SHA256}"));
+        let data = unsafe { std::slice::from_raw_parts(task.ucode_data.cast::<u8>(), extent) };
+        if format!("{:x}", Sha256::digest(data)) != hash {
+            return Err(format!("expected {revision} data: SHA-256 {hash}"));
         }
         self.load_data(data);
         unsafe { self.commands(task.data_ptr.cast(), task.data_size) }
@@ -145,10 +164,26 @@ impl NativeContext {
         if count != 0 && packets.is_null() {
             return Err("null native audio command list".into());
         }
-        self.state.dmem.set_word(SEGMENT_TABLE, 0);
+        if self.microcode == Microcode::Classic {
+            self.state.dmem.set_word(SEGMENT_TABLE, 0);
+        }
+        let dispatch = if self.microcode == Microcode::Zelda {
+            self.state.zelda_start()
+        } else {
+            [0; 26]
+        };
         for i in 0..count as usize {
             let [w0, w1] = unsafe { packets.add(i).read_unaligned() };
-            self.state.command(&mut self.memory, w0 as u32, w1 as u64)?;
+            match self.microcode {
+                Microcode::Classic => self.state.command(&mut self.memory, w0 as u32, w1 as u64)?,
+                Microcode::Zelda => {
+                    self.state.scalar[TASK_DATA_SIZE] = (count - i as u32 - 1) * 8;
+                    self.state.scalar[CHUNK_REMAINING] =
+                        (count - i as u32).min(8 - i as u32 % 8) * 8 - 8;
+                    self.state
+                        .zelda_command(&mut self.memory, w0 as u32, w1 as u64, &dispatch)?;
+                }
+            }
         }
         Ok(())
     }

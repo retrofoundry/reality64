@@ -62,6 +62,9 @@ impl Memory for HostMemory {
         value: u32,
         write: bool,
     ) -> Result<(), String> {
+        if value == u32::MAX {
+            return Err("native audio DMA length underflow".into());
+        }
         let dma = Dma::decode(value);
         let start = self.tokens.address(dram)? & !7;
         let extent = dma.rows * dma.length + (dma.rows - 1) * dma.skip;
@@ -101,7 +104,7 @@ impl NativeContext {
         self.memory.tokens.address(token)
     }
 
-    /// Execute a native classic task synchronously. The caller must abort on error.
+    /// Execute a native classic task synchronously. On error the task stops at the failing command.
     ///
     /// # Safety
     /// `task` must point to a live host OSTask. Its data payload must be readable for

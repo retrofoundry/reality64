@@ -32,6 +32,13 @@ unsafe fn run(context: &mut NativeContext, packets: &[[usize; 2]]) -> Result<(),
 }
 
 #[test]
+fn zero_length_adpcm_load_fails_without_accessing_host_memory() {
+    let mut context = NativeContext::default();
+    let error = unsafe { run(&mut context, &[[0x0b000000, 8]]) }.unwrap_err();
+    assert!(error.contains("DMA length underflow"));
+}
+
+#[test]
 fn packets_use_low_immediates_full_pointers_and_ignore_segments() {
     let mut context = NativeContext::default();
     let mut source = [0x1122334455667788u64; 8];

@@ -400,8 +400,8 @@
 
 <h1 id="audio-microcode">Audio microcode<a class="headerlink" href="#audio-microcode" title="Permanent link">&para;</a></h1>
 <p>reality64 runs a game&rsquo;s audio command lists itself instead of emulating the RSP. Each handler is
-written for one microcode revision and reproduces it exactly: the same output samples, the same
-state in memory, the same DMEM contents after every task.</p>
+written for one microcode revision. The console-format path reproduces its output samples,
+state in memory and DMEM contents. The native path uses host-order samples and full host pointers.</p>
 <table>
 <thead>
 <tr>
@@ -416,15 +416,22 @@ state in memory, the same DMEM contents after every task.</p>
 <td>classic <code>aspMain</code>, Super Mario 64 (US)</td>
 <td>704 bytes, SHA-256 <code>79bb2a3e8555019bc4b229f0c218f1e329ca5711bfa55c7c7f992facf2e12c83</code></td>
 </tr>
+<tr>
+<td><code>R64_RSP_AUDIO_ZELDA</code> (9)</td>
+<td>Zelda <code>aspMain</code>, Ocarina of Time (NTSC 1.0)</td>
+<td>736 bytes, SHA-256 <code>7a2773900752702bd70e073813f6e57601a9c1c741b07057799bd882eaa10e27</code></td>
+</tr>
 </tbody>
 </table>
 <h2 id="what-the-port-provides">What the port provides<a class="headerlink" href="#what-the-port-provides" title="Permanent link">&para;</a></h2>
 <p>Register the microcode&rsquo;s text address with <code>R64RspRegister</code>, as for graphics.</p>
 <p>Link the real <code>aspMain</code> data section and point <code>OSTask.t.ucode_data</code> at it, with
-<code>ucode_data_size</code> set to its length. The handler reads its tables from there, the way the RSP
-loads them at the start of each task, so reality64 itself contains no microcode. Generate the data
-at build time from the game&rsquo;s own sources or ROM; don&rsquo;t commit it. A missing or different data
-section rejects the task with a message naming the revision reality64 expected.</p>
+<code>ucode_data_size</code> set to 704 for classic or 735 for Zelda. Zelda&rsquo;s size field is one less
+than its raw extent; the pointer must still cover all 736 bytes. The handler reads its tables
+from there, the way the RSP loads them at the start of each task, so reality64 itself contains
+no microcode. Generate the data at build time from the game&rsquo;s own sources or ROM; don&rsquo;t commit
+it. A missing or different data section rejects the task with a message naming the revision
+reality64 expected.</p>
 <p>Commands are reality64&rsquo;s native <code>Acmd</code> packets: two 64-bit words, with full host pointers wherever
 the console command carries an RDRAM address.</p>
 <p>Keep data in the representation the game&rsquo;s CPU code already uses: PCM, codebooks, loop history
@@ -433,7 +440,14 @@ and voice state as host-order 16-bit values, compressed ADPCM bytes as they come
 DMA, the handler rounds addresses down to a multiple of 8 and lengths up, so allocations must
 also cover those rounded extents.</p>
 <p>Tasks run synchronously on the calling guest thread and keep their state between tasks. A loop
-or state buffer the game hands to one task must stay alive while later tasks can use it.</p>
+or state buffer the game hands to one task must stay alive while later tasks can use it.
+Native classic and Zelda tasks have separate persistent contexts. Neither shares physical
+RSP state with the runtime&rsquo;s graphics or JPEG handlers.</p>
+<p>Zelda envelope commands must be consecutive: ENVSETUP1 → ENVSETUP2 → ENVMIXER, as emitted by
+the synthesis builder. Interleaving other commands can change scalar registers, vector state
+and subsequent DMEM output. Self-modifying dispatch is unsupported: a command
+whose dispatch target was overwritten earlier in the task returns an error instead of
+executing the original hard-coded handler.</p>
 <p>A task that fails stops at the failing command and is still completed, so the game keeps running;
 its error is logged. Output the task wrote before that command stays in place. One such failure is
 a DMA whose length counts down below zero: the register value then means 256 rows of 4 KB with a
@@ -441,9 +455,15 @@ a DMA whose length counts down below zero: the register value then means 256 row
 <h2 id="how-it-was-checked">How it was checked<a class="headerlink" href="#how-it-was-checked" title="Permanent link">&para;</a></h2>
 <p>The handlers were checked against the microcode itself, running on a real N64 and in an
 interpreter that matches the console byte for byte. Synthetic tasks cover every command&rsquo;s
-boundaries; real command lists captured from the game cover ordinary play. Byte-level operations
-at odd addresses on 16-bit data are one place the native representation can differ from the
-console, and no game we know of issues them. The other is the refused underflowing DMA above.</p>
+boundaries, and consumer fixtures reproduce command sequences emitted by the games&rsquo; builders.
+Console checks compare all captured regions and all 4096 DMEM bytes. Native checks normalize
+typed halfwords and retained pointers, excluding console transport and spans with incompatible
+raw/halfword interpretations. They are not full-capture byte-equality checks.</p>
+<p>Native output can differ from the console in two places: odd-address operations on halfword data,
+and the refused underflowing DMA above. The port must audit the first: Zelda&rsquo;s comb-filter builder
+can form odd addresses, though the saved consumer fixtures do not establish an executed gameplay
+case. Logical byte windows through the microcode&rsquo;s halfword tables are handled separately,
+including small ADPCM&rsquo;s odd windows.</p>
 
               
             </article>

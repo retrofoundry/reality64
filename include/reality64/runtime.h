@@ -29,6 +29,7 @@ typedef enum {
     R64_RSP_AUDIO_ACMD = 5,   /* the Rust classic US aspMain handler; requires its 704-byte raw data */
     R64_RSP_JPEG_NJPGDSP = 6, /* Ocarina of Time's njpgdspMain, RGBA5551 output */
     R64_RSP_SKIP = 7,         /* complete the task without running anything */
+    R64_RSP_GFX_F3DZEX_NON = 8, /* F3DZEX NoN: like F3DEX2 NoN, but G_BRANCH_Z tests W */
 } R64RspHandler;
 
 typedef struct {

@@ -219,6 +219,17 @@ impl Scheduler {
                 }
                 // Still the sole choice after our one wait: resume, holding the token.
                 _ if waited => return,
+                // Replay time moves only when guest work drains; a sole yielder is spinning on
+                // an event, so step the clock with the token held, as `dispatch` does when idle.
+                _ if crate::gamepad::script::replaying() => {
+                    drop(g);
+                    super::vi::step_replay();
+                    g = self.inner.lock().unwrap();
+                    while g.running != Some(me) {
+                        g = self.cv.wait(g).unwrap();
+                    }
+                    waited = true;
+                }
                 _ => {
                     // Sole choice: wait for a `wake` (wake_gen bump), the token being taken, or the
                     // timeout. Reading wake_gen under the lock we wait on avoids a lost wakeup.

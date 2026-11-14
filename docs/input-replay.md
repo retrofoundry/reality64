@@ -28,7 +28,10 @@ progress. PI DMA takes no virtual time: the oldest pending transfer completes at
 each guest message send or receive and before each step, one transfer at a time.
 This stands in for the PI interrupt, so it arrives early when a message call
 follows the request sooner than the cart would deliver, and late when a guest runs
-a long stretch without one.
+a long stretch without one. The audio interface follows the same clock: AI length,
+status and queue-full results come from accepted buffers playing at the source rate
+in virtual time, with live playback's queue cap and 80 ms prebuffer, and nothing
+reaches the output device.
 
 `osGetTime` and `osGetCount` read this virtual clock; time does not advance while
 guest code or a synchronous graphics task is running. Timers fire at the first

@@ -97,7 +97,7 @@ struct SchedInner {
 
 /// Process-global cooperative-priority scheduler: a single run token behind a Mutex+Condvar.
 /// Only the token holder runs guest code. reschedule() is called at scheduling points
-/// (osStartThread, osSetThreadPri; the blocking primitives below feed the joins).
+/// (osStartThread, osSetThreadPri, a guest's osSendMesg/osRecvMesg; the blocking primitives below feed the joins).
 pub struct Scheduler {
     inner: Mutex<SchedInner>,
     cv: Condvar,

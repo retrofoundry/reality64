@@ -172,6 +172,8 @@ pub extern "C" fn R64SpTaskStartGo(task: *mut c_void) {
                 log::error!("classic audio task failed: {error}");
                 std::process::abort();
             }
+            // The post can hand the token to a thread that starts the next audio task.
+            drop(context);
             event::post(OS_EVENT_SP);
         }
         Handler::JpegNjpgdsp => {

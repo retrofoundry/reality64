@@ -49,6 +49,17 @@ fn lookup(key: usize) -> Arc<Mutex<Queue>> {
         .clone()
 }
 
+/// A guest's own send or receive is a scheduling point: a ready thread that outranks the caller
+/// runs now. libultra switches only when the call wakes a waiter, but on the console a VI or
+/// timer interrupt would already have preempted for any thread a host wake left ready, so
+/// checking on every call stands in for that preemption. Host threads hold no token and defer.
+fn scheduling_point() {
+    let me = sched::current_id();
+    if me != 0 {
+        sched::scheduler().reschedule(Some(me));
+    }
+}
+
 /// Runs `fill`, then posts without blocking, like a device manager's completion: returns 0 if posted,
 /// -1 if the full queue dropped it (the work still happened), -2 if unavailable (no work).
 /// `fill` runs under the queue lock and must not lock a message queue itself.
@@ -98,6 +109,8 @@ pub(crate) fn send(key: usize, msg: usize, flag: i32) -> i32 {
             if let Some(w) = g.recv_waiters.pop_front() {
                 sched::wake(w); // atomic mark-READY+wake, under the queue lock
             }
+            drop(g);
+            scheduling_point();
             return 0;
         }
         if flag != OS_MESG_BLOCK {
@@ -144,6 +157,8 @@ pub(crate) fn recv(key: usize, flag: i32) -> (i32, usize) {
             if let Some(s) = g.send_waiters.pop_front() {
                 sched::wake(s);
             }
+            drop(g);
+            scheduling_point();
             return (0, m);
         }
         if flag != OS_MESG_BLOCK {
@@ -332,100 +347,100 @@ mod tests {
         }
     }
 
-    static F3_Q: AtomicUsize = AtomicUsize::new(0);
-    static F3_Q2: AtomicUsize = AtomicUsize::new(0);
-    static F3_SEQ: AtomicUsize = AtomicUsize::new(0);
-    static F3_WAKER_YIELD_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static F3_TARGET_RESUME_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static F3_TARGET_DONE: AtomicBool = AtomicBool::new(false);
+    static WAKE_Q: AtomicUsize = AtomicUsize::new(0);
+    static WAKE_Q2: AtomicUsize = AtomicUsize::new(0);
+    static WAKE_SEQ: AtomicUsize = AtomicUsize::new(0);
+    static WAKER_SENT_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static TARGET_RESUME_SEQ: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static TARGET_DONE: AtomicBool = AtomicBool::new(false);
 
-    extern "C" fn f3_target(_arg: *mut std::os::raw::c_void) {
-        // pri-100: park in recv(BLOCK) until the pri-10 waker sends, then stamp resume order.
-        let (ret, m) = recv(F3_Q.load(Ordering::SeqCst), 1); // BLOCK
+    extern "C" fn wake_target(_arg: *mut std::os::raw::c_void) {
+        let (ret, m) = recv(WAKE_Q.load(Ordering::SeqCst), 1); // BLOCK
         assert_eq!(ret, 0);
         assert_eq!(m, 0x99);
-        F3_TARGET_RESUME_SEQ.store(F3_SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
-        F3_TARGET_DONE.store(true, Ordering::SeqCst);
+        TARGET_RESUME_SEQ.store(WAKE_SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        TARGET_DONE.store(true, Ordering::SeqCst);
     }
 
-    extern "C" fn f3_waker(_arg: *mut std::os::raw::c_void) {
-        // pri-10 holds the token: wake the higher-priority target, then keep running to
-        // our OWN next park_self (recv on Q2). The target must not resume until we park.
-        send(F3_Q.load(Ordering::SeqCst), 0x99, 0); // wakes target; deferred (we hold the token)
-        F3_WAKER_YIELD_SEQ.store(F3_SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
-        let _ = recv(F3_Q2.load(Ordering::SeqCst), 1); // BLOCK -> park_self; only now may target run
+    extern "C" fn waker(_arg: *mut std::os::raw::c_void) {
+        send(WAKE_Q.load(Ordering::SeqCst), 0x99, 0);
+        WAKER_SENT_SEQ.store(WAKE_SEQ.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        let _ = recv(WAKE_Q2.load(Ordering::SeqCst), 1); // BLOCK
     }
 
-    #[test]
-    fn wake_defers_to_token_holder_no_preempt() {
+    /// Park a `target_pri` thread in recv, have a `waker_pri` thread send to it, and return
+    /// whether the target resumed before the waker continued past its send.
+    fn target_resumes_first(target_pri: i32, waker_pri: i32) -> bool {
         let mut qbacking = [0u8; 64];
         let mut q2backing = [0u8; 64];
         let q = qbacking.as_mut_ptr() as usize;
         let q2 = q2backing.as_mut_ptr() as usize;
         create(q, 1);
         create(q2, 1);
-        F3_Q.store(q, Ordering::SeqCst);
-        F3_Q2.store(q2, Ordering::SeqCst);
-        F3_SEQ.store(0, Ordering::SeqCst);
-        F3_WAKER_YIELD_SEQ.store(usize::MAX, Ordering::SeqCst);
-        F3_TARGET_RESUME_SEQ.store(usize::MAX, Ordering::SeqCst);
-        F3_TARGET_DONE.store(false, Ordering::SeqCst);
+        WAKE_Q.store(q, Ordering::SeqCst);
+        WAKE_Q2.store(q2, Ordering::SeqCst);
+        WAKE_SEQ.store(0, Ordering::SeqCst);
+        WAKER_SENT_SEQ.store(usize::MAX, Ordering::SeqCst);
+        TARGET_RESUME_SEQ.store(usize::MAX, Ordering::SeqCst);
+        TARGET_DONE.store(false, Ordering::SeqCst);
 
-        // Start the high-priority target first so it parks in recv(BLOCK)...
-        let mut tstore = [0u8; 128];
-        let tt = tstore.as_mut_ptr() as *mut std::os::raw::c_void;
+        // Fresh storage per case: a reused OSThread key could collide with the last case's exit.
+        let tt = Box::leak(Box::new([0u8; 128])).as_mut_ptr() as *mut std::os::raw::c_void;
         crate::ultra::thread::R64ThreadCreate(
             tt,
             6,
-            f3_target,
+            wake_target,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            100,
+            target_pri,
         );
         crate::ultra::thread::R64ThreadStart(tt);
-
-        // ...then the low-priority waker (the token holder that performs the send).
-        let mut wstore = [0u8; 128];
-        let ww = wstore.as_mut_ptr() as *mut std::os::raw::c_void;
-        crate::ultra::thread::R64ThreadCreate(
-            ww,
-            7,
-            f3_waker,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            10,
-        );
-        crate::ultra::thread::R64ThreadStart(ww);
-
-        for _ in 0..400 {
-            if F3_TARGET_DONE.load(Ordering::SeqCst) {
+        for _ in 0..2000 {
+            if crate::ultra::sched::is_blocked(tt as usize) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(
-            F3_TARGET_DONE.load(Ordering::SeqCst),
-            "pri-100 target never resumed"
+            crate::ultra::sched::is_blocked(tt as usize),
+            "target never parked in recv"
         );
 
-        let wy = F3_WAKER_YIELD_SEQ.load(Ordering::SeqCst);
-        let tr = F3_TARGET_RESUME_SEQ.load(Ordering::SeqCst);
-        assert_ne!(
-            wy,
-            usize::MAX,
-            "pri-10 waker never reached its next park_self"
+        let ww = Box::leak(Box::new([0u8; 128])).as_mut_ptr() as *mut std::os::raw::c_void;
+        crate::ultra::thread::R64ThreadCreate(
+            ww,
+            7,
+            waker,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            waker_pri,
         );
-        assert_ne!(tr, usize::MAX, "pri-100 target never recorded its resume");
-        // The pri-10 token holder reaches its next park_self BEFORE the pri-100 target
-        // resumes: proof that wake() defers instead of preempting mid-execution (F3).
-        assert!(
-            wy < tr,
-            "pri-100 target preempted the pri-10 token holder (F3 data race)"
-        );
+        crate::ultra::thread::R64ThreadStart(ww);
 
-        // Cleanup: release the parked waker so its guest thread exits before the next test.
+        for _ in 0..400 {
+            if TARGET_DONE.load(Ordering::SeqCst)
+                && WAKER_SENT_SEQ.load(Ordering::SeqCst) != usize::MAX
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let sent = WAKER_SENT_SEQ.load(Ordering::SeqCst);
+        let resumed = TARGET_RESUME_SEQ.load(Ordering::SeqCst);
+        assert_ne!(sent, usize::MAX, "waker never continued past its send");
+        assert_ne!(resumed, usize::MAX, "target never resumed");
+
+        // Release the parked waker so its guest thread exits before the next case.
         send(q2, 0xEE, 0);
         std::thread::sleep(std::time::Duration::from_millis(20));
+        resumed < sent
+    }
+
+    #[test]
+    fn guest_send_switches_only_to_a_higher_priority_waiter() {
+        // libultra's osStartThread: a woken thread that outranks the sender runs at once.
+        assert!(target_resumes_first(100, 10));
+        assert!(!target_resumes_first(10, 10));
     }
 
     #[test]

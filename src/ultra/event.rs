@@ -129,7 +129,7 @@ mod tests {
         crate::ultra::thread::R64ThreadStart(t);
 
         // Deterministically confirm the guest actually PARKED in recv(BLOCK) on the SI queue
-        // before we post — modeled on mesg::tests' F3 poll-until-state technique instead of a
+        // before we post — modeled on mesg::tests' poll-until-state technique instead of a
         // fixed sleep. `sched::is_blocked(tid)` becomes true once the guest ran `set_blocked`
         // + `park_self` (registered & !ready). The bound is generous (~10s) so a loaded
         // multi-threaded runner can never false-fail; a normal run trips it in the first poll

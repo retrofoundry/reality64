@@ -332,7 +332,7 @@
 <p><code>include/reality64/interpolation.h</code> exposes annotation ABI 2. Call
 <code>R64InterpolationRegister(R64_INTERPOLATION_ABI_VERSION)</code> once at startup. It returns
 zero on success or -1 with an error diagnostic on an ABI mismatch. Check that result.</p>
-<p>This C sidecar version is independent of ultragfx&rsquo;s Rust annotation ABI 3. The adapter
+<p>This C sidecar version is independent of ultragfx&rsquo;s Rust annotation types. The adapter
 uses invocation scopes without composed views; no C layout or caller changes are needed.</p>
 <p>Initialize <code>R64TaskAnnotations</code> with <code>R64_TASK_ANNOTATIONS_INIT</code>, then set <code>source</code>,
 <code>epoch</code>, <code>producer_sample</code>, <code>draws</code> and <code>draw_count</code>. Attach it to the graphics

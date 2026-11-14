@@ -4,6 +4,7 @@
 use crate::ultra::rcp::{take_render_receiver, RenderMsg};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -118,6 +119,15 @@ pub struct SurfaceHandoff {
     pub display_millihz: Option<u32>,
 }
 
+static REFRESH_SETTINGS: OnceLock<interpolation::Settings> = OnceLock::new();
+
+/// The rate the render thread passes to `set_refresh_rate` at its next scanout.
+pub(crate) fn requested_refresh_rate() -> Option<ultragfx::RefreshRate> {
+    REFRESH_SETTINGS
+        .get()
+        .map(|settings| settings.rate(crate::interpolation::port_settings().1))
+}
+
 pub struct RenderContext {
     renderer: ultragfx::Renderer,
     frame_serial: u64,
@@ -137,6 +147,7 @@ impl RenderContext {
         let selection = capture::Selection::from_env().expect("reality64 capture configuration");
         let interpolation = interpolation::Settings::from_env(selection.is_some())
             .expect("reality64 refresh-rate configuration");
+        let _ = REFRESH_SETTINGS.set(interpolation);
         if let Some(selection) = &selection {
             selection.install_shutdown_handler();
         }
@@ -871,5 +882,69 @@ mod tests {
         };
         render_loop_on(&mut ctx, rx);
         assert_eq!(ctx.log, ["task", "commit", "resize"]);
+    }
+
+    #[test]
+    fn replay_reports_the_requested_rate_and_live_the_latched_one() {
+        use crate::interpolation::{R64InterpolationActive, R64SetRefreshRate, ACTIVE};
+
+        if std::env::var_os("REALITY64_REPLAY_TEST_CHILD").is_none() {
+            let path =
+                std::env::temp_dir().join(format!("reality64_interp_{}.input", std::process::id()));
+            std::fs::write(&path, "reality64-input 1 1\n0 0000 0 0\nend 0\n").unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "render::tests::replay_reports_the_requested_rate_and_live_the_latched_one",
+                    "--nocapture",
+                ])
+                .env("REALITY64_INPUT_REPLAY", &path)
+                .env_remove("REALITY64_INPUT_RECORD")
+                .env_remove("REALITY64_REFRESH_RATE")
+                .env_remove("ULTRAGFX_CAPTURE_DIR")
+                .env_remove("ULTRAGFX_CAPTURE_SEQUENCE")
+                .env("REALITY64_REPLAY_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        REFRESH_SETTINGS
+            .set(interpolation::Settings::from_env(false).unwrap())
+            .ok()
+            .unwrap();
+        assert!(crate::gamepad::script::replaying());
+        assert!(
+            !ACTIVE.load(Ordering::Acquire),
+            "no scanout has latched a rate"
+        );
+        assert_eq!(R64SetRefreshRate(1, 0.0), 0);
+        assert_eq!(
+            R64InterpolationActive(),
+            1,
+            "replay follows the requested rate"
+        );
+        assert_eq!(R64SetRefreshRate(0, 0.0), 0);
+        assert_eq!(
+            R64InterpolationActive(),
+            0,
+            "a rate the game sets later is read at once"
+        );
+
+        crate::ultra::vi::R64ViSwapBuffer(std::ptr::null_mut());
+        assert!(!crate::gamepad::script::replaying());
+        ACTIVE.store(true, Ordering::Release);
+        assert_eq!(
+            R64InterpolationActive(),
+            1,
+            "live follows the renderer's latch"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use ultragfx::RefreshRate;
 
+#[derive(Clone, Copy)]
 pub(super) struct Settings {
     override_rate: Option<RefreshRate>,
     capture: bool,

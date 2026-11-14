@@ -31,7 +31,9 @@ follows the request sooner than the cart would deliver, and late when a guest ru
 a long stretch without one. The audio interface follows the same clock: AI length,
 status and queue-full results come from accepted buffers playing at the source rate
 in virtual time, with live playback's queue cap and 80 ms prebuffer, and nothing
-reaches the output device.
+reaches the output device. `R64InterpolationActive` reports the requested refresh
+rate instead of the rate the renderer latched at its last scanout, so the first
+annotated task follows guest order.
 
 `osGetTime` and `osGetCount` read this virtual clock; time does not advance while
 guest code or a synchronous graphics task is running. Timers fire at the first

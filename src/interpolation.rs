@@ -327,7 +327,15 @@ pub extern "C" fn R64SetRefreshRate(mode: u32, hz: f64) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn R64InterpolationActive() -> i32 {
-    i32::from(ACTIVE.load(std::sync::atomic::Ordering::Acquire))
+    // In replay the guest reads the requested rate: the renderer latches it at its first scanout,
+    // which the guest does not wait for, so the latch would make the first annotated task race.
+    let active = if crate::ultra::vi::replay_nanos().is_some() {
+        crate::render::requested_refresh_rate()
+            .is_some_and(|rate| rate != ultragfx::RefreshRate::Original)
+    } else {
+        ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+    };
+    i32::from(active)
 }
 
 #[cfg(test)]

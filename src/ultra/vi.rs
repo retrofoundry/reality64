@@ -512,6 +512,18 @@ mod tests {
             assert!(step_replay());
             assert_eq!(mesg::recv(mq as usize, 0), (0, 0x66));
         }
+        let sched = super::super::sched::Scheduler::new();
+        sched.register(1, 10);
+        sched.mark_ready(1);
+        sched.reschedule(None);
+        let before_yield = replay_elapsed_nanos();
+        sched.reschedule_yield(Some(1));
+        assert_eq!(
+            mesg::recv(mq as usize, 0),
+            (0, 0x66),
+            "a sole yielder steps the replay clock"
+        );
+        assert!(replay_elapsed_nanos() > before_yield);
         R64ViSwapBuffer(std::ptr::null_mut());
         assert_eq!(script::read().button, 0x8000);
         timer::R64SetTimer(timer_ptr, OS_CPU_COUNTER / 10, 0, mq, 0x88 as *mut c_void);

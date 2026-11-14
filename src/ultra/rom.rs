@@ -132,14 +132,12 @@ fn cart_dma(
     if size > 0 && dram.is_null() {
         return R64_ERR_BAD_ARG;
     }
-    match mesg::post_with(ret_queue, mb, || {
-        if size > 0 {
-            unsafe { std::ptr::copy(src, dram, size) };
-        }
-    }) {
-        -2 => R64_ERR_QUEUE,
-        _ => R64_OK,
+    if !mesg::registered(ret_queue) {
+        return R64_ERR_QUEUE;
     }
+    // The loaded ROM is never replaced, so `src` outlives the transfer.
+    crate::ultra::pi::start(src, dram, size, ret_queue, mb);
+    R64_OK
 }
 
 fn cart_read_io(rom: &Rom, base: u32, dev_addr: u32) -> Result<u32, i32> {
@@ -252,7 +250,7 @@ pub extern "C" fn R64RomLoad(ptr: *const u8, len: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ultra::mesg;
+    use crate::ultra::{mesg, pi};
     use std::ptr;
 
     fn container(payload: &[u8]) -> Vec<u8> {
@@ -314,12 +312,14 @@ mod tests {
 
     #[test]
     fn cart_dma_reads_offset_and_completes() {
+        let _pi = pi::test_lock();
         let r = rom(&[0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD]);
         let q = fresh_queue(1);
         let mb = 0x1234usize;
         let mut dst = [0u8; 4];
         let rc = cart_dma(&r, mb, 0xB000_0000, 0x1000_0004, dst.as_mut_ptr(), 4, q);
         assert_eq!(rc, R64_OK);
+        pi::complete_all();
         assert_eq!(dst, [0xAA, 0xBB, 0xCC, 0xDD]);
         let (ret, m) = mesg::recv(q, 0);
         assert_eq!(ret, 0);
@@ -328,6 +328,7 @@ mod tests {
 
     #[test]
     fn cart_dma_bounds_reject_without_side_effect() {
+        let _pi = pi::test_lock();
         let r = rom(&[1, 2, 3, 4]);
         let q = fresh_queue(1);
         let mut dst = [9u8; 8];
@@ -335,6 +336,7 @@ mod tests {
             cart_dma(&r, 1, 0xB000_0000, 0x1000_0000, dst.as_mut_ptr(), 8, q),
             R64_ERR_RANGE
         );
+        pi::complete_all();
         assert_eq!(dst, [9u8; 8], "no copy on out-of-range");
         assert_eq!(
             cart_dma(&r, 1, 0, 0x0000_0000, dst.as_mut_ptr(), 4, q),
@@ -344,6 +346,7 @@ mod tests {
 
     #[test]
     fn cart_dma_full_queue_still_copies() {
+        let _pi = pi::test_lock();
         let r = rom(&[0xAA, 0xBB, 0xCC, 0xDD]);
         let q = fresh_queue(1);
         assert_eq!(mesg::send(q, 0x1, 0), 0);
@@ -352,6 +355,7 @@ mod tests {
             cart_dma(&r, 1, 0xB000_0000, 0x1000_0000, dst.as_mut_ptr(), 4, q),
             R64_OK
         );
+        pi::complete_all();
         assert_eq!(dst, [0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
@@ -453,6 +457,7 @@ mod tests {
 
     #[test]
     fn cart_dma_zero_len_still_validates_address() {
+        let _pi = pi::test_lock();
         let r = rom(&[1, 2, 3, 4]);
         let q = fresh_queue(1);
         assert_eq!(
@@ -472,12 +477,14 @@ mod tests {
             cart_dma(&r, 0x55, 0xB000_0000, 0x1000_0000, ptr::null_mut(), 0, q),
             R64_OK
         );
+        pi::complete_all();
         assert_eq!(mesg::recv(q, 0), (0, 0x55));
     }
 
     #[test]
     fn ffi_global_slot_roundtrip() {
         let _guard = GLOBAL_SLOT_TEST.lock().unwrap();
+        let _pi = pi::test_lock();
         rom_slot_reset();
         let mut out: u32 = 0xDEAD_BEEF;
         assert_eq!(
@@ -516,6 +523,7 @@ mod tests {
             ),
             R64_OK
         );
+        pi::complete_all();
         assert_eq!(dst, [0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(mesg::recv(q, 0), (0, mb));
 

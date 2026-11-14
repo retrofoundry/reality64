@@ -52,12 +52,19 @@ fn lookup(key: usize) -> Arc<Mutex<Queue>> {
 /// A guest's own send or receive is a scheduling point: a ready thread that outranks the caller
 /// runs now. libultra switches only when the call wakes a waiter, but on the console a VI or
 /// timer interrupt would already have preempted for any thread a host wake left ready, so
-/// checking on every call stands in for that preemption. Host threads hold no token and defer.
+/// checking on every call stands in for that preemption. The oldest pending PI transfer completes
+/// here too, standing in for its interrupt; the caller holds the token, so no guest runs during
+/// the copy. Host threads hold no token and defer.
 fn scheduling_point() {
     let me = sched::current_id();
     if me != 0 {
+        super::pi::complete_next();
         sched::scheduler().reschedule(Some(me));
     }
+}
+
+pub(crate) fn registered(key: usize) -> bool {
+    registry().lock().is_ok_and(|r| r.contains_key(&key))
 }
 
 /// Runs `fill`, then posts without blocking, like a device manager's completion: returns 0 if posted,
@@ -162,6 +169,12 @@ pub(crate) fn recv(key: usize, flag: i32) -> (i32, usize) {
             return (0, m);
         }
         if flag != OS_MESG_BLOCK {
+            drop(g);
+            // A guest spinning on a PI reply never reaches an idle point; on the console the PI
+            // interrupt would preempt the spin and post the reply.
+            if sched::current_id() != 0 && super::pi::complete_through(key) {
+                continue;
+            }
             return (-1, 0); // empty + NOBLOCK
         }
         // empty + BLOCK: enqueue self and park (mark-BLOCKED under the queue lock)

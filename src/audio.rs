@@ -18,8 +18,10 @@ use arie::{
 };
 
 use model::DescriptorTracker;
+use replay::ReplayDrain;
 
 pub(crate) mod model;
+mod replay;
 
 // C-boundary result codes — the Rust mirror of the `R64_AUDIO_*` enum in
 // `include/reality64/internal.h`. `R64AudioResult` is `i32` on both sides.
@@ -134,6 +136,12 @@ struct AudioRuntime {
     /// and should stay zero; it exists purely so a real drop is observable
     /// (telemetry) rather than silent.
     dropped_dma_count: u64,
+    /// The replay clock in nanoseconds, `None` outside replay.
+    clock: fn() -> Option<u64>,
+    /// Drives the guest-visible AI while `clock` runs; built with the player.
+    drain: Option<ReplayDrain>,
+    /// Whether `tracker` holds drain positions rather than player positions.
+    tracking_replay: bool,
 }
 
 impl AudioRuntime {
@@ -146,6 +154,34 @@ impl AudioRuntime {
             unavailable: true,
             shutdown: false,
             dropped_dma_count: 0,
+            clock: crate::ultra::vi::replay_nanos,
+            drain: None,
+            tracking_replay: false,
+        }
+    }
+
+    /// The replay time, discarding tracked spans when the clock starts or stops, since
+    /// drain and player positions don't mix.
+    fn replay_now(&mut self) -> Option<u64> {
+        let now = (self.clock)();
+        if now.is_some() != self.tracking_replay {
+            self.tracker.clear();
+            self.tracking_replay = now.is_some();
+        }
+        now
+    }
+
+    fn count_dropped_dma(&mut self) {
+        self.dropped_dma_count = self.dropped_dma_count.saturating_add(1);
+        // Production-visible telemetry (not cfg-gated), rate-limited so a
+        // pathological stall can't flood the log: the first drop and every
+        // 256th are logged at warn level, so a real drop is operationally
+        // observable in release, not silent.
+        if self.dropped_dma_count == 1 || self.dropped_dma_count.is_multiple_of(256) {
+            log::warn!(
+                "reality64 audio: Arie QueueFull dropped a guest DMA (dropped_dma_count = {})",
+                self.dropped_dma_count
+            );
         }
     }
 
@@ -186,9 +222,15 @@ impl AudioRuntime {
             prebuffer: Duration::from_millis(PREBUFFER_MS),
             maximum_software_queue: frames_to_duration_ceil(capacity_frames, rate),
         };
+        let drain = ReplayDrain::new(
+            rate,
+            replay::frames_ceil(config.maximum_software_queue.as_nanos(), rate),
+            replay::frames_ceil(config.prebuffer.as_nanos(), rate),
+        );
         match self.factory.create(config) {
             Ok(player) => {
                 self.player = Some(player);
+                self.drain = Some(drain);
                 self.rate = Some(rate);
                 self.unavailable = false;
                 R64_AUDIO_OK
@@ -214,6 +256,23 @@ impl AudioRuntime {
         }
         if self.unavailable {
             return R64_AUDIO_UNAVAILABLE;
+        }
+        if let Some(now) = self.replay_now() {
+            let Some(drain) = self.drain.as_mut() else {
+                return R64_AUDIO_UNAVAILABLE;
+            };
+            drain.advance(now);
+            self.tracker.reap(drain.retired());
+            return match drain.queue(u64::from(byte_count / BYTES_PER_FRAME), now) {
+                Some((start, end)) => {
+                    self.tracker.push(start, end);
+                    R64_AUDIO_OK
+                }
+                None => {
+                    self.count_dropped_dma();
+                    R64_AUDIO_QUEUE_FULL
+                }
+            };
         }
         let Some(player) = self.player.as_mut() else {
             return R64_AUDIO_UNAVAILABLE;
@@ -241,17 +300,7 @@ impl AudioRuntime {
             // means a genuinely overfull host queue: count it so the drop is
             // observable rather than silent, and still report it distinctly.
             Err(QueueError::QueueFull { .. }) => {
-                self.dropped_dma_count = self.dropped_dma_count.saturating_add(1);
-                // Production-visible telemetry (not cfg-gated), rate-limited so a
-                // pathological stall can't flood the log: the first drop and every
-                // 256th are logged at warn level, so a real drop is operationally
-                // observable in release, not silent.
-                if self.dropped_dma_count == 1 || self.dropped_dma_count.is_multiple_of(256) {
-                    log::warn!(
-                        "reality64 audio: Arie QueueFull dropped a guest DMA (dropped_dma_count = {})",
-                        self.dropped_dma_count
-                    );
-                }
+                self.count_dropped_dma();
                 R64_AUDIO_QUEUE_FULL
             }
             // Terminal Arie state (device lost / position counter exhausted): the
@@ -285,6 +334,13 @@ impl AudioRuntime {
     fn current_length(&mut self) -> u32 {
         if self.unavailable {
             return 0;
+        }
+        if let Some(now) = self.replay_now() {
+            let Some(drain) = self.drain.as_mut() else {
+                return 0;
+            };
+            drain.advance(now);
+            return self.tracker.current_dma_remaining_bytes(drain.retired());
         }
         // Snapshot the live retired position (and whether Arie is terminal),
         // releasing the player borrow before touching the tracker.
@@ -329,9 +385,25 @@ impl AudioRuntime {
     /// DMA_BUSY mirrors the N64 register's "an accepted DMA is still in flight"
     /// meaning (true during `Prebuffering`/`Starved` when occupancy `> 0`), not
     /// "the host callback is currently playing".
-    fn status(&self) -> u32 {
+    fn status(&mut self) -> u32 {
         if self.unavailable {
             return 0;
+        }
+        let target_frames =
+            u64::from(self.rate.unwrap_or(0)).saturating_mul(AI_TARGET_DEPTH_MS) / 1000;
+        if let Some(now) = self.replay_now() {
+            let Some(drain) = self.drain.as_mut() else {
+                return 0;
+            };
+            drain.advance(now);
+            let mut out = 0;
+            if drain.running() && drain.queued() >= target_frames {
+                out |= R64_AI_FIFO_FULL;
+            }
+            if drain.queued() > 0 {
+                out |= R64_AI_DMA_BUSY;
+            }
+            return out;
         }
         let Some(player) = self.player.as_ref() else {
             return 0;
@@ -339,8 +411,6 @@ impl AudioRuntime {
         let Some(s) = player.status() else {
             return 0;
         };
-        let target_frames =
-            u64::from(self.rate.unwrap_or(0)).saturating_mul(AI_TARGET_DEPTH_MS) / 1000;
         let mut out: u32 = 0;
         if s.state == PlaybackState::Running && s.software_queued_source_frames >= target_frames {
             out |= R64_AI_FIFO_FULL;
@@ -374,6 +444,9 @@ impl AudioRuntime {
         match player.clear() {
             Ok(()) => {
                 self.tracker.clear();
+                if let Some(drain) = self.drain.as_mut() {
+                    drain.clear();
+                }
                 R64_AUDIO_OK
             }
             Err(_) => {
@@ -1064,5 +1137,90 @@ mod tests {
         let mut guard = runtime.lock().unwrap();
         assert_eq!(guard.current_length(), 0);
         assert_eq!(guard.submit(&[0i16; 8 * 2], 8 * 4), R64_AUDIO_UNAVAILABLE);
+    }
+
+    thread_local! {
+        static REPLAY_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn replay_clock() -> Option<u64> {
+        REPLAY_NOW.with(|now| now.get())
+    }
+
+    fn set_replay_now(nanos: Option<u64>) {
+        REPLAY_NOW.with(|now| now.set(nanos));
+    }
+
+    fn submit_frames(rt: &mut AudioRuntime, frames: usize) -> R64AudioResult {
+        rt.submit(&vec![0i16; frames * 2], (frames * 4) as u32)
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn replay_length_and_status_follow_the_replay_clock_not_the_device() {
+        let (mut rt, h) = fake();
+        rt.clock = replay_clock;
+        set_replay_now(Some(0));
+        assert_eq!(rt.set_source_rate(32_000), R64_AUDIO_OK);
+
+        // 2000 frames are below the 2560-frame prebuffer: nothing drains.
+        assert_eq!(submit_frames(&mut rt, 2000), R64_AUDIO_OK);
+        set_replay_now(Some(50 * MS));
+        assert_eq!(rt.current_length(), 2000 * 4);
+        assert_eq!(rt.status(), R64_AI_DMA_BUSY);
+
+        // Reaching the prebuffer starts playback at the replay time of the submit.
+        assert_eq!(submit_frames(&mut rt, 1000), R64_AUDIO_OK);
+        assert_eq!(rt.status(), R64_AI_FIFO_FULL | R64_AI_DMA_BUSY);
+        set_replay_now(Some(50 * MS + 31_250_000));
+        assert_eq!(rt.current_length(), 1000 * 4);
+        assert_eq!(rt.status(), R64_AI_DMA_BUSY);
+
+        // Past the end the queue starves.
+        set_replay_now(Some(500 * MS));
+        assert_eq!(rt.current_length(), 0);
+        assert_eq!(rt.status(), 0);
+
+        // Nothing reached the device, and its position never mattered.
+        let state = player(&h, 0);
+        assert_eq!(state.lock().unwrap().queue_calls, 0);
+        set_retired(&h, 0, 3000);
+        assert_eq!(submit_frames(&mut rt, 1000), R64_AUDIO_OK);
+        assert_eq!(rt.current_length(), 1000 * 4);
+    }
+
+    #[test]
+    fn replay_rejects_at_the_live_queue_cap() {
+        let (mut rt, _h) = fake();
+        rt.clock = replay_clock;
+        set_replay_now(Some(0));
+        assert_eq!(rt.set_source_rate(32_000), R64_AUDIO_OK);
+
+        // One maximum legal DMA plus one 80 ms target depth fills the cap exactly.
+        assert_eq!(submit_frames(&mut rt, 0x3fff8 / 4), R64_AUDIO_OK);
+        assert_eq!(submit_frames(&mut rt, 2560), R64_AUDIO_OK);
+        assert_eq!(submit_frames(&mut rt, 2), R64_AUDIO_QUEUE_FULL);
+        assert_eq!(rt.dropped_dma_count(), 1);
+
+        // Two frames play in 62.5 us at 32 kHz, which makes room for two more.
+        set_replay_now(Some(62_500));
+        assert_eq!(submit_frames(&mut rt, 2), R64_AUDIO_OK);
+        assert_eq!(submit_frames(&mut rt, 2), R64_AUDIO_QUEUE_FULL);
+    }
+
+    #[test]
+    fn leaving_replay_returns_to_the_device_position() {
+        let (mut rt, h) = fake();
+        rt.clock = replay_clock;
+        set_replay_now(Some(0));
+        assert_eq!(rt.set_source_rate(32_000), R64_AUDIO_OK);
+        assert_eq!(submit_frames(&mut rt, 1000), R64_AUDIO_OK);
+
+        set_replay_now(None);
+        assert_eq!(rt.current_length(), 0);
+        assert_eq!(submit_frames(&mut rt, 528), R64_AUDIO_OK);
+        assert_eq!(player(&h, 0).lock().unwrap().queue_calls, 1);
+        assert_eq!(rt.current_length(), 528 * 4);
     }
 }

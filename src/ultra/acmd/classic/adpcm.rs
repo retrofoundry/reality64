@@ -20,7 +20,7 @@ impl<O: HalfwordOrder> Context<O> {
         (book, shift)
     }
 
-    fn adpcm_book(&mut self, address: u32) {
+    pub(in crate::ultra::acmd) fn adpcm_book(&mut self, address: u32) {
         self.load_quad(21, address);
         self.load_quad(20, address + 16);
         for i in 0..7 {
@@ -28,7 +28,11 @@ impl<O: HalfwordOrder> Context<O> {
         }
     }
 
-    fn adpcm_group(&self, residual: [u16; 8], history: [u16; 8]) -> [i32; 8] {
+    pub(in crate::ultra::acmd) fn adpcm_group(
+        &self,
+        residual: [u16; 8],
+        history: [u16; 8],
+    ) -> [i32; 8] {
         std::array::from_fn(|i| {
             let mut total = signed(self.vectors[21][i]) * signed(history[6])
                 + signed(self.vectors[20][i]) * signed(history[7])

@@ -251,15 +251,21 @@ fn clock_loop(hz: u32, on_tick: TickFn, stop_rx: Receiver<()>, pre_post: impl Fn
     let mut tick: u64 = 1;
     // Loop ends when a tick's deadline would exceed u64 ns (~584 yr) or a stop is
     // signaled (the `break`s below).
-    while let Ok(target_ns) = checked_deadline_nanos(tick, hz) {
+    'clock: while let Ok(target_ns) = checked_deadline_nanos(tick, hz) {
         let target = epoch + Duration::from_nanos(target_ns);
-        // Interruptible coarse wait up to the spin margin; wakes early on stop.
-        let coarse = target
-            .saturating_duration_since(Instant::now())
-            .saturating_sub(CLOCK_SPIN_MARGIN);
-        match stop_rx.recv_timeout(coarse) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
+        // Interruptible coarse wait up to the spin margin, in steps no longer than the
+        // margin: one long timed wait can oversleep past the margin and the deadline.
+        loop {
+            let coarse = target
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(CLOCK_SPIN_MARGIN);
+            if coarse.is_zero() {
+                break;
+            }
+            match stop_rx.recv_timeout(coarse.min(CLOCK_SPIN_MARGIN)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break 'clock,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
         }
         // Precise final approach to the absolute deadline.
         spin_sleep::sleep(target.saturating_duration_since(Instant::now()));

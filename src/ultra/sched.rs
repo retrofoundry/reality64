@@ -93,7 +93,14 @@ struct SchedInner {
     /// waits on the condvar for this to change; read/written under the Mutex, so the wakeup can't
     /// be lost.
     wake_gen: u64,
+    /// The token holder is blocked in `rcp::submit_and_wait` and runs no guest code until the
+    /// render thread has walked its task, so the render thread may complete the previous one.
+    gfx_parked: bool,
+    host_work: bool,
 }
+
+/// `running` while a host thread holds the token (`run_as_host`): wakes defer, as for a guest.
+const HOST: usize = usize::MAX;
 
 /// Process-global cooperative-priority scheduler: a single run token behind a Mutex+Condvar.
 /// Only the token holder runs guest code. reschedule() is called at scheduling points
@@ -110,6 +117,8 @@ impl Scheduler {
                 entries: HashMap::new(),
                 running: None,
                 wake_gen: 0,
+                gfx_parked: false,
+                host_work: false,
             }),
             cv: Condvar::new(),
         }
@@ -120,14 +129,18 @@ impl Scheduler {
         mut g: MutexGuard<'a, SchedInner>,
         mut idle: impl FnMut() -> bool,
     ) -> MutexGuard<'a, SchedInner> {
+        if g.running == Some(HOST) || g.gfx_parked {
+            return g;
+        }
         let mut next = pick_next(&g.entries, g.running);
         while next.is_none() && g.running.is_some() {
             // Keep the run token while injecting: wake() must not start a guest mid-step.
+            g.host_work = false;
             drop(g);
             let advanced = idle();
             g = self.inner.lock().unwrap();
             next = pick_next(&g.entries, g.running);
-            if !advanced {
+            if !advanced && !g.host_work {
                 break;
             }
         }
@@ -202,6 +215,12 @@ impl Scheduler {
         // At most one blocking wait, then loop back once to recompute the handoff.
         let mut waited = false;
         loop {
+            drop(g);
+            super::rcp::complete_live();
+            g = self.inner.lock().unwrap();
+            while g.running != Some(me) {
+                g = self.cv.wait(g).unwrap();
+            }
             match pick_next_yield(&g.entries, me) {
                 Some(next) if next != me => {
                     // Equal-or-higher peer READY: hand off and wait until we hold the token again.
@@ -251,6 +270,37 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn set_gfx_parked(&self, parked: bool) {
+        self.inner.lock().unwrap().gfx_parked = parked;
+    }
+
+    /// Run `f` on a host thread as if it held the run token: when no guest holds it (it is taken
+    /// for the duration and passed on after), or when the holder is parked in a graphics submit.
+    /// Returns false without running `f` while a guest runs; that guest completes the work at its
+    /// next scheduling point instead.
+    pub(crate) fn run_as_host(&self, f: impl FnOnce()) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let take = match g.running {
+            None => true,
+            Some(_) if g.gfx_parked => false,
+            Some(_) => {
+                g.host_work = true;
+                return false;
+            }
+        };
+        if take {
+            g.running = Some(HOST);
+        }
+        drop(g);
+        f();
+        if take {
+            let mut g = self.inner.lock().unwrap();
+            g.running = pick_next(&g.entries, None);
+            self.cv.notify_all();
+        }
+        true
+    }
+
     /// A thread's entry function returned: retire it and pass the token on.
     pub fn on_exit(&self, key: usize) {
         let mut g = self.inner.lock().unwrap();
@@ -269,10 +319,10 @@ impl Default for Scheduler {
     }
 }
 
-/// What happens when no guest is ready: the next PI transfer completes, else replay steps a
-/// retrace. Returns whether either woke anything that could run.
+/// What happens when no guest is ready: the next PI transfer completes, else a finished graphics
+/// task completes, else replay steps a retrace. Returns whether either woke anything that could run.
 fn idle_step() -> bool {
-    super::pi::complete_next() || super::vi::step_replay()
+    super::pi::complete_next() || super::rcp::complete_live() || super::vi::step_replay()
 }
 
 static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
@@ -334,6 +384,14 @@ pub fn wake(id: usize) {
     scheduler().cv.notify_all();
 }
 
+pub(crate) fn set_gfx_parked(parked: bool) {
+    scheduler().set_gfx_parked(parked);
+}
+
+pub(crate) fn run_as_host(f: impl FnOnce()) -> bool {
+    scheduler().run_as_host(f)
+}
+
 /// The token-holder blocks itself: hand the token to the next runnable thread (ALWAYS
 /// recompute `pick_next` first — `me` is already `ready == false` via `set_blocked`), then
 /// wait until this thread holds the token again.
@@ -355,6 +413,23 @@ pub fn park_self() {
 pub(crate) fn is_blocked(id: usize) -> bool {
     let g = scheduler().inner.lock().unwrap();
     g.entries.get(&id).map(|e| !e.ready).unwrap_or(false)
+}
+
+/// Whether no guest can run while the caller works: it holds the run token, or it is a host
+/// thread and the token is held for it or by a holder parked in a graphics submit.
+pub(crate) fn guests_excluded() -> bool {
+    let g = scheduler().inner.lock().unwrap();
+    let me = current_id();
+    match g.running {
+        Some(HOST) => me == 0,
+        Some(holder) => holder == me || (me == 0 && g.gfx_parked),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gfx_parked() -> bool {
+    scheduler().inner.lock().unwrap().gfx_parked
 }
 
 #[cfg(test)]
@@ -399,6 +474,113 @@ mod tests {
             g.running, None,
             "an idle step that wakes nothing waits for a host event"
         );
+    }
+
+    #[test]
+    fn a_finish_racing_the_last_idle_step_is_not_stranded() {
+        let sched = Scheduler::new();
+        sched.register(1, 10);
+        sched.register(2, 20);
+        let mut g = sched.inner.lock().unwrap();
+        g.running = Some(1);
+        let mut steps = 0;
+        g = sched.dispatch(g, || {
+            steps += 1;
+            if steps == 1 {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        assert!(!sched.run_as_host(|| panic!("guest still holds the token")));
+                    });
+                });
+                false
+            } else {
+                sched.mark_ready(2);
+                true
+            }
+        });
+        assert_eq!(steps, 2, "a refused finish must be retried before idling");
+        assert_eq!(g.running, Some(2));
+    }
+
+    #[test]
+    fn wake_defers_while_the_host_holds_guest_memory() {
+        if super::super::rcp::tests::isolated(
+            "ultra::sched::tests::wake_defers_while_the_host_holds_guest_memory",
+            false,
+        ) {
+            return;
+        }
+        let sched = scheduler();
+        sched.register(1, 10);
+        assert!(sched.run_as_host(|| {
+            wake(1);
+            let g = sched.inner.lock().unwrap();
+            assert!(g.entries[&1].ready);
+            assert_eq!(
+                g.running,
+                Some(HOST),
+                "wake cannot start a guest during host work"
+            );
+        }));
+        assert_eq!(sched.inner.lock().unwrap().running, Some(1));
+        sched.on_exit(1);
+    }
+
+    #[test]
+    fn replay_idle_keeps_a_ready_task_for_start_go() {
+        if super::super::rcp::tests::isolated(
+            "ultra::sched::tests::replay_idle_keeps_a_ready_task_for_start_go",
+            true,
+        ) {
+            return;
+        }
+        let sched = scheduler();
+        sched.register(1, 10);
+        sched.mark_ready(1);
+        sched.inner.lock().unwrap().running = Some(1);
+        set_current_id(1);
+        let mut byte = 0u8;
+        super::super::rcp::finished(vec![ultragfx::GuestWrite {
+            address: &mut byte as *mut u8 as u64,
+            bytes: vec![7],
+        }]);
+        assert!(!idle_step(), "replay idle cannot complete DP");
+        assert_eq!(byte, 0);
+        assert!(super::super::rcp::complete_ready());
+        assert_eq!(byte, 7);
+        sched.on_exit(1);
+    }
+
+    #[test]
+    fn a_host_runs_only_on_a_free_token_or_a_parked_holder() {
+        let sched = Scheduler::new();
+        sched.register(1, 10);
+        sched.mark_ready(1);
+        sched.inner.lock().unwrap().running = Some(1);
+        assert!(!sched.run_as_host(|| panic!("ran while the holder runs guest code")));
+
+        sched.set_gfx_parked(true);
+        assert!(sched.run_as_host(|| {
+            sched.register(2, 20);
+            sched.mark_ready(2);
+            sched.reschedule(None);
+        }));
+        assert_eq!(sched.inner.lock().unwrap().running, Some(1));
+        sched.set_gfx_parked(false);
+
+        sched.inner.lock().unwrap().running = None;
+        let held = sched.run_as_host(|| {
+            let mut g = sched.inner.lock().unwrap();
+            assert_eq!(g.running, Some(HOST));
+            g = sched.dispatch(g, || false);
+            assert_eq!(
+                g.running,
+                Some(HOST),
+                "nothing dispatches while the host holds it"
+            );
+        });
+        assert!(held);
+        assert_eq!(sched.inner.lock().unwrap().running, Some(2));
     }
 
     #[test]

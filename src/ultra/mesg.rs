@@ -59,6 +59,7 @@ fn scheduling_point() {
     let me = sched::current_id();
     if me != 0 {
         super::pi::complete_next();
+        super::rcp::complete_live();
         sched::scheduler().reschedule(Some(me));
     }
 }
@@ -170,9 +171,10 @@ pub(crate) fn recv(key: usize, flag: i32) -> (i32, usize) {
         }
         if flag != OS_MESG_BLOCK {
             drop(g);
-            // A guest spinning on a PI reply never reaches an idle point; on the console the PI
-            // interrupt would preempt the spin and post the reply.
-            if sched::current_id() != 0 && super::pi::complete_through(key) {
+            // A polling guest holds the token; device interrupts must still complete its work.
+            if sched::current_id() != 0
+                && (super::pi::complete_through(key) || super::rcp::complete_live())
+            {
                 continue;
             }
             return (-1, 0); // empty + NOBLOCK

@@ -233,7 +233,8 @@ impl RenderContext {
         data_ptr: usize,
         microcode: ultragfx::Microcode,
         sidecar: Option<crate::interpolation::Sidecar>,
-    ) {
+        released: &mut dyn FnMut(),
+    ) -> Vec<ultragfx::GuestWrite> {
         self.frame_serial += 1;
         self.pending_task = None;
         let capture = if let Some(sequence) = &mut self.capture_sequence {
@@ -245,8 +246,9 @@ impl RenderContext {
                     "capture sequence begin frame {}: {error}; shutting down",
                     self.frame_serial
                 );
+                released();
                 crate::ultra::request_shutdown();
-                return;
+                return Vec::new();
             }
             Some(
                 sequence
@@ -278,11 +280,11 @@ impl RenderContext {
             ultragfx::HostRam::with_ranges(&[], &ranges)
         };
         let bindings = crate::ultra::rsp::graphics_bindings();
-        // SAFETY: the guest stays blocked until consume_dl returns, so every span the walk
-        // reads remains live and stable in the guest's native layout.
+        // SAFETY: the guest stays blocked until `released` runs, so every span the walk reads
+        // remains live and stable in the guest's native layout.
         let result = unsafe {
             if let Some(capture) = capture {
-                capture
+                let result = capture
                     .process_dl_host_with_bindings(
                         &mut self.renderer,
                         ram,
@@ -292,12 +294,14 @@ impl RenderContext {
                         &mut DedupLogSink,
                         bindings,
                     )
-                    .map(|_| ())
+                    .map(|_| ());
+                released();
+                result
             } else if crate::interpolation::port_settings().0
                 && self.renderer.interpolation_active()
             {
                 let sidecar = sidecar.unwrap_or_default();
-                let task = self.renderer.submit_task_host(
+                let task = self.renderer.submit_task_host_released(
                     ram,
                     data_ptr as u64,
                     microcode,
@@ -312,24 +316,22 @@ impl RenderContext {
                         annotations: Some(&sidecar.annotations),
                         microcode_bindings: bindings,
                     },
+                    released,
                 );
                 self.pending_task = Some(task);
                 Ok(())
             } else {
-                let _ = self.renderer.process_dl_host_with_bindings(
+                let _ = self.renderer.process_dl_host_released(
                     ram,
                     data_ptr as u64,
                     microcode,
                     &mut DedupLogSink,
                     bindings,
+                    released,
                 );
                 Ok(())
             }
         };
-        // The guest holds its run token until consume_dl returns, including capture processing.
-        unsafe {
-            apply_guest_writes(self.renderer.take_guest_writes());
-        }
         if let Err(error) = result {
             log::error!(
                 "capture frame {}: {error}; shutting down",
@@ -337,6 +339,7 @@ impl RenderContext {
             );
             crate::ultra::request_shutdown();
         }
+        self.renderer.take_guest_writes()
     }
 
     pub fn present(&mut self, address: Option<u64>) {
@@ -399,7 +402,7 @@ impl RenderContext {
     }
 }
 
-unsafe fn apply_guest_writes(patches: Vec<ultragfx::GuestWrite>) {
+pub(crate) unsafe fn apply_guest_writes(patches: Vec<ultragfx::GuestWrite>) {
     for patch in patches {
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -413,12 +416,14 @@ unsafe fn apply_guest_writes(patches: Vec<ultragfx::GuestWrite>) {
 
 /// Consume/present/resize seam so the loop's dispatch is unit-testable without a GPU.
 pub(crate) trait GfxConsumer {
+    /// Calls `released` once, as soon as the walk no longer reads guest memory.
     fn consume_dl(
         &mut self,
         data_ptr: usize,
         microcode: ultragfx::Microcode,
         sidecar: Option<crate::interpolation::Sidecar>,
-    );
+        released: &mut dyn FnMut(),
+    ) -> Vec<ultragfx::GuestWrite>;
     fn scanout(&mut self, address: u64, _enqueued_at: std::time::Instant) {
         self.present(Some(address));
     }
@@ -436,8 +441,9 @@ impl GfxConsumer for RenderContext {
         data_ptr: usize,
         microcode: ultragfx::Microcode,
         sidecar: Option<crate::interpolation::Sidecar>,
-    ) {
-        RenderContext::consume_dl(self, data_ptr, microcode, sidecar)
+        released: &mut dyn FnMut(),
+    ) -> Vec<ultragfx::GuestWrite> {
+        RenderContext::consume_dl(self, data_ptr, microcode, sidecar, released)
     }
     fn present(&mut self, address: Option<u64>) {
         RenderContext::present(self, address)
@@ -497,8 +503,13 @@ pub(crate) fn render_loop_on(ctx: &mut impl GfxConsumer, rx: Receiver<RenderMsg>
                 done,
                 sidecar,
             } => {
-                ctx.consume_dl(data_ptr, microcode, sidecar);
-                let _ = done.send(()); // release the blocked guest → it posts SP then DP
+                crate::ultra::rcp::complete_before_walk();
+                // Releasing the guest lets it post SP; DP follows once the patches are applied.
+                let writes = ctx.consume_dl(data_ptr, microcode, sidecar, &mut || {
+                    crate::ultra::sched::set_gfx_parked(false);
+                    let _ = done.send(());
+                });
+                crate::ultra::rcp::finished(writes);
 
                 // OoT's pause setup task does not swap; keep the previous image until it does.
                 if scanout.is_none() && ctx.original() {
@@ -605,7 +616,7 @@ mod tests {
         );
     }
 
-    use crate::ultra::rcp::RenderMsg;
+    use crate::ultra::rcp::{tests::isolated, RenderMsg};
     use std::sync::mpsc::{channel, Receiver};
     use std::time::Duration;
 
@@ -619,9 +630,12 @@ mod tests {
             data_ptr: usize,
             microcode: ultragfx::Microcode,
             _sidecar: Option<crate::interpolation::Sidecar>,
-        ) {
+            released: &mut dyn FnMut(),
+        ) -> Vec<ultragfx::GuestWrite> {
+            released();
             self.log
                 .push(format!("consume:{data_ptr:#x}:{microcode:?}"));
+            Vec::new()
         }
         fn present(&mut self, address: Option<u64>) {
             assert_eq!(address, None);
@@ -638,6 +652,12 @@ mod tests {
 
     #[test]
     fn render_loop_dispatch_and_done_before_present() {
+        if isolated(
+            "render::tests::render_loop_dispatch_and_done_before_present",
+            false,
+        ) {
+            return;
+        }
         let (tx_done, rx_done) = channel::<()>();
         let (tx, rx) = channel::<RenderMsg>();
         tx.send(RenderMsg::Gfx {
@@ -666,7 +686,13 @@ mod tests {
     }
 
     #[test]
-    fn render_loop_applies_patches_before_done_and_orders_scanout() {
+    fn render_loop_releases_each_task_and_orders_scanout() {
+        if isolated(
+            "render::tests::render_loop_releases_each_task_and_orders_scanout",
+            false,
+        ) {
+            return;
+        }
         struct Consumer {
             memory: [u16; 3],
             completions: Vec<Receiver<()>>,
@@ -679,7 +705,8 @@ mod tests {
                 word: usize,
                 _: ultragfx::Microcode,
                 _: Option<crate::interpolation::Sidecar>,
-            ) {
+                released: &mut dyn FnMut(),
+            ) -> Vec<ultragfx::GuestWrite> {
                 assert!(matches!(
                     self.completions[self.consumed].try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty)
@@ -692,15 +719,9 @@ mod tests {
                     address: self.memory.as_mut_ptr() as u64 + 2,
                     bytes: (word as u16).to_ne_bytes().to_vec(),
                 };
-                unsafe {
-                    apply_guest_writes(vec![color, patch]);
-                }
-                assert_eq!(self.memory, [0xf801, word as u16, 0x1234]);
-                assert!(matches!(
-                    self.completions[self.consumed].try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Empty)
-                ));
+                released();
                 self.consumed += 1;
+                vec![color, patch]
             }
             fn present(&mut self, address: Option<u64>) {
                 if let Some(done) = self.completions.get(self.consumed.wrapping_sub(1)) {
@@ -753,6 +774,9 @@ mod tests {
 
     #[test]
     fn no_swap_task_is_never_committed() {
+        if isolated("render::tests::no_swap_task_is_never_committed", false) {
+            return;
+        }
         struct Consumer {
             consumed: u64,
             committed: Vec<(u64, u64, std::time::Instant)>,
@@ -763,8 +787,11 @@ mod tests {
                 _: usize,
                 _: ultragfx::Microcode,
                 _: Option<crate::interpolation::Sidecar>,
-            ) {
+                released: &mut dyn FnMut(),
+            ) -> Vec<ultragfx::GuestWrite> {
+                released();
                 self.consumed += 1;
+                Vec::new()
             }
             fn scanout(&mut self, address: u64, enqueued_at: std::time::Instant) {
                 self.committed.push((self.consumed, address, enqueued_at));
@@ -829,6 +856,12 @@ mod tests {
 
     #[test]
     fn interpolation_dispatches_every_swap_without_a_separate_present() {
+        if isolated(
+            "render::tests::interpolation_dispatches_every_swap_without_a_separate_present",
+            false,
+        ) {
+            return;
+        }
         struct Consumer {
             log: Vec<&'static str>,
             done: Receiver<()>,
@@ -839,8 +872,11 @@ mod tests {
                 _: usize,
                 _: ultragfx::Microcode,
                 _: Option<crate::interpolation::Sidecar>,
-            ) {
+                released: &mut dyn FnMut(),
+            ) -> Vec<ultragfx::GuestWrite> {
+                released();
                 self.log.push("task");
+                Vec::new()
             }
             fn scanout(&mut self, _: u64, _: Instant) {
                 assert!(self.done.try_recv().is_ok());
